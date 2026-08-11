@@ -3,7 +3,7 @@
 /*  React (cargado como global vía CDN en index.html)                   */
 /* ------------------------------------------------------------------ */
 
-const { useState, useEffect, useMemo, useCallback } = React;
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
 /* ------------------------------------------------------------------ */
 /*  Firebase (Auth + Firestore) — reemplaza el config de abajo con     */
@@ -149,15 +149,41 @@ const fmt = (n, moneda = "PEN") => {
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
 // Calcula la cuota mensual de un préstamo por el sistema francés (cuota fija),
-// a partir del monto, la tasa de interés anual (%) y el número de cuotas.
-const calcCuota = (monto, tasaAnual, numCuotas) => {
+// a partir del monto, la tasa de interés y el número de cuotas.
+// tipoTasa: "anual" = TCEA (tasa de costo efectiva anual) → se convierte a mensual efectiva.
+//           "mensual" = TCEM (tasa de costo efectiva mensual) → se usa directamente.
+const tasaMensualEfectiva = (tasa, tipoTasa) => {
+  const t = (Number(tasa) || 0) / 100;
+  if (tipoTasa === "mensual") return t;
+  return Math.pow(1 + t, 1 / 12) - 1; // TCEA → TCEM equivalente
+};
+
+const calcCuota = (monto, tasa, numCuotas, tipoTasa = "anual") => {
   const n = Number(numCuotas) || 0;
   const capital = Number(monto) || 0;
   if (n <= 0 || capital <= 0) return 0;
-  const i = (Number(tasaAnual) || 0) / 100 / 12;
+  const i = tasaMensualEfectiva(tasa, tipoTasa);
   if (i === 0) return capital / n;
   const cuota = (capital * i) / (1 - Math.pow(1 + i, -n));
   return Number.isFinite(cuota) ? cuota : 0;
+};
+
+// Arma un link de "agregar evento" de Google Calendar (evento de un día, sin
+// necesidad de iniciar sesión ni de una integración OAuth) para recordar la
+// fecha de pago de un préstamo.
+const googleCalendarLink = (loan) => {
+  if (!loan.fechaPago) return "";
+  const start = loan.fechaPago.replace(/-/g, "");
+  const endDate = new Date(loan.fechaPago);
+  endDate.setDate(endDate.getDate() + 1);
+  const end = endDate.toISOString().slice(0, 10).replace(/-/g, "");
+  const accion = loan.tipo === "Presté" ? "Cobrar" : "Pagar";
+  const cuotaTxto = loan.numCuotas ? ` (cuota ${fmt(loan.cuotaMonto || calcCuota(loan.monto, loan.tasaInteres, loan.numCuotas, loan.tipoTasa), loan.moneda)})` : "";
+  const text = encodeURIComponent(`${accion} préstamo — ${loan.persona}${cuotaTxto}`);
+  const details = encodeURIComponent(
+    `Préstamo registrado en Control de Dinero.\nMonto: ${fmt(loan.monto, loan.moneda)}${loan.numCuotas ? `\nCuotas: ${loan.numCuotas}` : ""}${loan.tasaInteres ? `\nTasa: ${loan.tasaInteres}% (${loan.tipoTasa === "mensual" ? "TCEM" : "TCEA"})` : ""}`
+  );
+  return `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${text}&dates=${start}/${end}&details=${details}`;
 };
 
 /* ------------------------------------------------------------------ */
@@ -294,8 +320,21 @@ function TrendLineChart({ data, dataKey, height = 200, color = "#0d9488" }) {
 /* ------------------------------------------------------------------ */
 
 function Modal({ title, onClose, children }) {
+  // Evita que el modal se cierre al seleccionar texto con el mouse: solo cierra
+  // si el mousedown Y el click ocurrieron directamente sobre el fondo (backdrop),
+  // no cuando el arrastre de una selección de texto termina fuera de la tarjeta.
+  const mouseDownOnBackdrop = useRef(false);
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/50 p-4" onClick={onClose}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/50 p-4"
+      onMouseDown={(e) => {
+        mouseDownOnBackdrop.current = e.target === e.currentTarget;
+      }}
+      onClick={(e) => {
+        if (mouseDownOnBackdrop.current && e.target === e.currentTarget) onClose();
+        mouseDownOnBackdrop.current = false;
+      }}
+    >
       <div
         className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-white shadow-2xl"
         onClick={(e) => e.stopPropagation()}
@@ -740,8 +779,10 @@ function FinanceDashboard({ user }) {
         estado: "Pendiente",
         txId,
         tasaInteres: form.tasaInteres || 0,
+        tipoTasa: form.tipoTasa || "anual",
         numCuotas: form.numCuotas || 0,
         cuotaMonto: form.cuotaMonto || 0,
+        fechaPago: form.fechaPago || "",
       },
       ...prev,
     ]);
@@ -1280,6 +1321,7 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete, onEdit
                 <th className="px-4 py-3">Interés</th>
                 <th className="px-4 py-3">Cuotas</th>
                 <th className="px-4 py-3">Fecha</th>
+                <th className="px-4 py-3">Pago</th>
                 <th className="px-4 py-3">Estado</th>
                 <th className="px-4 py-3"></th>
               </tr>
@@ -1294,17 +1336,34 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete, onEdit
                     </span>
                   </td>
                   <td className="whitespace-nowrap px-4 py-2.5 font-mono font-medium text-stone-800">{fmt(l.monto, l.moneda)}</td>
-                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">{l.tasaInteres ? `${l.tasaInteres}%` : "—"}</td>
+                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">
+                    {l.tasaInteres ? `${l.tasaInteres}% ${l.tipoTasa === "mensual" ? "TCEM" : "TCEA"}` : "—"}
+                  </td>
                   <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">
                     {l.numCuotas ? (
                       <span>
-                        {l.numCuotas} × {fmt(l.cuotaMonto || calcCuota(l.monto, l.tasaInteres, l.numCuotas), l.moneda)}
+                        {l.numCuotas} × {fmt(l.cuotaMonto || calcCuota(l.monto, l.tasaInteres, l.numCuotas, l.tipoTasa), l.moneda)}
                       </span>
                     ) : (
                       "—"
                     )}
                   </td>
                   <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">{l.fecha}</td>
+                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">
+                    {l.fechaPago ? (
+                      <a
+                        href={googleCalendarLink(l)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-teal-700 hover:underline"
+                        title="Agregar a Google Calendar"
+                      >
+                        {l.fechaPago}
+                      </a>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
                   <td className="px-4 py-2.5">
                     <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${l.estado === "Pendiente" ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}>
                       {l.estado}
@@ -1632,8 +1691,10 @@ function LoanModal({ accounts, onClose, onSave }) {
   const [fecha, setFecha] = useState(todayISO());
   const [descripcion, setDescripcion] = useState("");
   const [tasaInteres, setTasaInteres] = useState("");
+  const [tipoTasa, setTipoTasa] = useState("anual");
   const [numCuotas, setNumCuotas] = useState("");
   const [cuotaMonto, setCuotaMonto] = useState("");
+  const [fechaPago, setFechaPago] = useState("");
   const cuentasDisponibles = accounts.filter((a) => (a.monedas || ["PEN"]).includes(moneda));
   const [cuenta, setCuenta] = useState("");
 
@@ -1641,7 +1702,7 @@ function LoanModal({ accounts, onClose, onSave }) {
     if (!cuentasDisponibles.find((a) => a.nombre === cuenta)) setCuenta(cuentasDisponibles[0]?.nombre || "");
   }, [moneda]);
 
-  const cuotaCalculada = calcCuota(monto, tasaInteres, numCuotas);
+  const cuotaCalculada = calcCuota(monto, tasaInteres, numCuotas, tipoTasa);
 
   const handleCalcularCuota = () => {
     setCuotaMonto(cuotaCalculada ? cuotaCalculada.toFixed(2) : "");
@@ -1658,8 +1719,10 @@ function LoanModal({ accounts, onClose, onSave }) {
       fecha,
       descripcion,
       tasaInteres: Number(tasaInteres) || 0,
+      tipoTasa,
       numCuotas: Number(numCuotas) || 0,
       cuotaMonto: Number(cuotaMonto) || 0,
+      fechaPago,
     });
   };
 
@@ -1711,9 +1774,17 @@ function LoanModal({ accounts, onClose, onSave }) {
 
       <div className="mb-4 rounded-xl border border-stone-200 p-3">
         <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-stone-500">Intereses y cuotas (opcional)</div>
+        <Field label="Tipo de tasa">
+          <ChipGroup
+            options={["anual", "mensual"]}
+            value={tipoTasa}
+            onChange={setTipoTasa}
+            getLabel={(t) => (t === "anual" ? "Anual (TCEA)" : "Mensual (TCEM)")}
+          />
+        </Field>
         <div className="grid grid-cols-2 gap-2">
-          <Field label="Tasa de interés anual (%)">
-            <input type="number" step="0.01" min="0" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} placeholder="Ej. 24" />
+          <Field label={tipoTasa === "anual" ? "Tasa de costo efectiva anual (%)" : "Tasa de costo efectiva mensual (%)"}>
+            <input type="number" step="0.01" min="0" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} placeholder={tipoTasa === "anual" ? "Ej. 24" : "Ej. 1.8"} />
           </Field>
           <Field label="N° de cuotas">
             <input type="number" step="1" min="0" value={numCuotas} onChange={(e) => setNumCuotas(e.target.value)} className={inputCls} placeholder="Ej. 12" />
@@ -1737,6 +1808,9 @@ function LoanModal({ accounts, onClose, onSave }) {
             </p>
           )}
         </Field>
+        <Field label="Fecha de pago (próxima cuota)">
+          <input type="date" value={fechaPago} onChange={(e) => setFechaPago(e.target.value)} className={inputCls} />
+        </Field>
       </div>
 
       <button onClick={handleSubmit} disabled={!cuenta || !monto || !persona} className="mt-2 w-full rounded-lg bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-700 disabled:opacity-50">
@@ -1752,11 +1826,13 @@ function LoanModal({ accounts, onClose, onSave }) {
 
 function EditLoanModal({ loan, onClose, onSave }) {
   const [tasaInteres, setTasaInteres] = useState(loan.tasaInteres || "");
+  const [tipoTasa, setTipoTasa] = useState(loan.tipoTasa || "anual");
   const [numCuotas, setNumCuotas] = useState(loan.numCuotas || "");
   const [cuotaMonto, setCuotaMonto] = useState(loan.cuotaMonto || "");
+  const [fechaPago, setFechaPago] = useState(loan.fechaPago || "");
   const [descripcion, setDescripcion] = useState(loan.descripcion || "");
 
-  const cuotaCalculada = calcCuota(loan.monto, tasaInteres, numCuotas);
+  const cuotaCalculada = calcCuota(loan.monto, tasaInteres, numCuotas, tipoTasa);
 
   const handleCalcularCuota = () => {
     setCuotaMonto(cuotaCalculada ? cuotaCalculada.toFixed(2) : "");
@@ -1765,8 +1841,10 @@ function EditLoanModal({ loan, onClose, onSave }) {
   const handleSubmit = () => {
     onSave({
       tasaInteres: Number(tasaInteres) || 0,
+      tipoTasa,
       numCuotas: Number(numCuotas) || 0,
       cuotaMonto: Number(cuotaMonto) || 0,
+      fechaPago,
       descripcion,
     });
   };
@@ -1777,9 +1855,18 @@ function EditLoanModal({ loan, onClose, onSave }) {
         Monto: <span className="font-mono font-semibold text-stone-900">{fmt(loan.monto, loan.moneda)}</span>
       </div>
 
+      <Field label="Tipo de tasa">
+        <ChipGroup
+          options={["anual", "mensual"]}
+          value={tipoTasa}
+          onChange={setTipoTasa}
+          getLabel={(t) => (t === "anual" ? "Anual (TCEA)" : "Mensual (TCEM)")}
+        />
+      </Field>
+
       <div className="mb-4 grid grid-cols-2 gap-2">
-        <Field label="Tasa de interés anual (%)">
-          <input type="number" step="0.01" min="0" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} placeholder="Ej. 24" />
+        <Field label={tipoTasa === "anual" ? "Tasa de costo efectiva anual (%)" : "Tasa de costo efectiva mensual (%)"}>
+          <input type="number" step="0.01" min="0" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} placeholder={tipoTasa === "anual" ? "Ej. 24" : "Ej. 1.8"} />
         </Field>
         <Field label="N° de cuotas">
           <input type="number" step="1" min="0" value={numCuotas} onChange={(e) => setNumCuotas(e.target.value)} className={inputCls} placeholder="Ej. 12" />
@@ -1803,6 +1890,10 @@ function EditLoanModal({ loan, onClose, onSave }) {
             Sugerido: {fmt(cuotaCalculada, loan.moneda)} / mes (sistema francés). Puedes ajustarlo manualmente.
           </p>
         )}
+      </Field>
+
+      <Field label="Fecha de pago (próxima cuota)">
+        <input type="date" value={fechaPago} onChange={(e) => setFechaPago(e.target.value)} className={inputCls} />
       </Field>
 
       <Field label="Descripción (opcional)">
