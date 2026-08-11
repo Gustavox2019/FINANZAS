@@ -148,6 +148,18 @@ const fmt = (n, moneda = "PEN") => {
 };
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
+// Calcula la cuota mensual de un préstamo por el sistema francés (cuota fija),
+// a partir del monto, la tasa de interés anual (%) y el número de cuotas.
+const calcCuota = (monto, tasaAnual, numCuotas) => {
+  const n = Number(numCuotas) || 0;
+  const capital = Number(monto) || 0;
+  if (n <= 0 || capital <= 0) return 0;
+  const i = (Number(tasaAnual) || 0) / 100 / 12;
+  if (i === 0) return capital / n;
+  const cuota = (capital * i) / (1 - Math.pow(1 + i, -n));
+  return Number.isFinite(cuota) ? cuota : 0;
+};
+
 /* ------------------------------------------------------------------ */
 /*  Gráficos en SVG puro (sin dependencias externas)                    */
 /* ------------------------------------------------------------------ */
@@ -520,6 +532,7 @@ function FinanceDashboard({ user }) {
   const [showAccModal, setShowAccModal] = useState(false);
   const [showLoanModal, setShowLoanModal] = useState(false);
   const [settlingLoan, setSettlingLoan] = useState(null);
+  const [editingLoan, setEditingLoan] = useState(null);
   const [saveState, setSaveState] = useState("idle");
 
   // Cargar datos desde Firestore al iniciar sesión
@@ -715,10 +728,26 @@ function FinanceDashboard({ user }) {
     };
     setTransactions((prev) => [tx, ...prev]);
     setLoans((prev) => [
-      { id: uid(), persona: form.persona, tipo: form.tipo, monto: form.monto, moneda: form.moneda, cuenta: form.cuenta, fecha: form.fecha, descripcion: form.descripcion, estado: "Pendiente", txId },
+      {
+        id: uid(),
+        persona: form.persona,
+        tipo: form.tipo,
+        monto: form.monto,
+        moneda: form.moneda,
+        cuenta: form.cuenta,
+        fecha: form.fecha,
+        descripcion: form.descripcion,
+        estado: "Pendiente",
+        txId,
+        tasaInteres: form.tasaInteres || 0,
+        numCuotas: form.numCuotas || 0,
+        cuotaMonto: form.cuotaMonto || 0,
+      },
       ...prev,
     ]);
   };
+
+  const updateLoan = (id, updates) => setLoans((prev) => prev.map((l) => (l.id === id ? { ...l, ...updates } : l)));
 
   const settleLoan = (loan, cuenta, fecha) => {
     const txId = uid();
@@ -882,6 +911,7 @@ function FinanceDashboard({ user }) {
               onAdd={() => setShowLoanModal(true)}
               onSettle={(loan) => setSettlingLoan(loan)}
               onDelete={deleteLoan}
+              onEdit={(loan) => setEditingLoan(loan)}
             />
           )}
           {tab === "cuentas" && (
@@ -944,6 +974,16 @@ function FinanceDashboard({ user }) {
           accounts={accounts.filter((a) => (a.monedas || []).includes(settlingLoan.moneda))}
           onClose={() => setSettlingLoan(null)}
           onConfirm={(cuenta, fecha) => settleLoan(settlingLoan, cuenta, fecha)}
+        />
+      )}
+      {editingLoan && (
+        <EditLoanModal
+          loan={editingLoan}
+          onClose={() => setEditingLoan(null)}
+          onSave={(updates) => {
+            updateLoan(editingLoan.id, updates);
+            setEditingLoan(null);
+          }}
         />
       )}
     </div>
@@ -1197,7 +1237,7 @@ function MultiCurrencySum({ obj }) {
   return <span>{parts.map((m) => fmt(obj[m], m)).join(" · ")}</span>;
 }
 
-function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete }) {
+function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete, onEdit }) {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -1237,6 +1277,8 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete }) {
                 <th className="px-4 py-3">Persona</th>
                 <th className="px-4 py-3">Tipo</th>
                 <th className="px-4 py-3">Monto</th>
+                <th className="px-4 py-3">Interés</th>
+                <th className="px-4 py-3">Cuotas</th>
                 <th className="px-4 py-3">Fecha</th>
                 <th className="px-4 py-3">Estado</th>
                 <th className="px-4 py-3"></th>
@@ -1252,6 +1294,16 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete }) {
                     </span>
                   </td>
                   <td className="whitespace-nowrap px-4 py-2.5 font-mono font-medium text-stone-800">{fmt(l.monto, l.moneda)}</td>
+                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">{l.tasaInteres ? `${l.tasaInteres}%` : "—"}</td>
+                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">
+                    {l.numCuotas ? (
+                      <span>
+                        {l.numCuotas} × {fmt(l.cuotaMonto || calcCuota(l.monto, l.tasaInteres, l.numCuotas), l.moneda)}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
                   <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">{l.fecha}</td>
                   <td className="px-4 py-2.5">
                     <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${l.estado === "Pendiente" ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}>
@@ -1260,6 +1312,9 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete }) {
                   </td>
                   <td className="px-4 py-2.5 text-right">
                     <div className="flex items-center justify-end gap-2">
+                      <button onClick={() => onEdit(l)} className="rounded p-1 text-stone-300 hover:bg-teal-50 hover:text-teal-600" title="Editar interés y cuotas">
+                        <Ico name="Pencil" size={14} />
+                      </button>
                       {l.estado === "Pendiente" && (
                         <button onClick={() => onSettle(l)} className="rounded-lg border border-teal-600 px-2.5 py-1 text-xs font-medium text-teal-700 hover:bg-teal-50">
                           Marcar liquidado
@@ -1576,6 +1631,9 @@ function LoanModal({ accounts, onClose, onSave }) {
   const [monto, setMonto] = useState("");
   const [fecha, setFecha] = useState(todayISO());
   const [descripcion, setDescripcion] = useState("");
+  const [tasaInteres, setTasaInteres] = useState("");
+  const [numCuotas, setNumCuotas] = useState("");
+  const [cuotaMonto, setCuotaMonto] = useState("");
   const cuentasDisponibles = accounts.filter((a) => (a.monedas || ["PEN"]).includes(moneda));
   const [cuenta, setCuenta] = useState("");
 
@@ -1583,9 +1641,26 @@ function LoanModal({ accounts, onClose, onSave }) {
     if (!cuentasDisponibles.find((a) => a.nombre === cuenta)) setCuenta(cuentasDisponibles[0]?.nombre || "");
   }, [moneda]);
 
+  const cuotaCalculada = calcCuota(monto, tasaInteres, numCuotas);
+
+  const handleCalcularCuota = () => {
+    setCuotaMonto(cuotaCalculada ? cuotaCalculada.toFixed(2) : "");
+  };
+
   const handleSubmit = () => {
     if (!persona || !monto || Number(monto) <= 0 || !cuenta) return;
-    onSave({ tipo, persona, monto: Number(monto), moneda, cuenta, fecha, descripcion });
+    onSave({
+      tipo,
+      persona,
+      monto: Number(monto),
+      moneda,
+      cuenta,
+      fecha,
+      descripcion,
+      tasaInteres: Number(tasaInteres) || 0,
+      numCuotas: Number(numCuotas) || 0,
+      cuotaMonto: Number(cuotaMonto) || 0,
+    });
   };
 
   return (
@@ -1634,8 +1709,108 @@ function LoanModal({ accounts, onClose, onSave }) {
         <input value={descripcion} onChange={(e) => setDescripcion(e.target.value)} className={inputCls} placeholder="Ej. para el pasaje del bus" />
       </Field>
 
+      <div className="mb-4 rounded-xl border border-stone-200 p-3">
+        <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-stone-500">Intereses y cuotas (opcional)</div>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Tasa de interés anual (%)">
+            <input type="number" step="0.01" min="0" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} placeholder="Ej. 24" />
+          </Field>
+          <Field label="N° de cuotas">
+            <input type="number" step="1" min="0" value={numCuotas} onChange={(e) => setNumCuotas(e.target.value)} className={inputCls} placeholder="Ej. 12" />
+          </Field>
+        </div>
+        <Field label="Monto de la cuota">
+          <div className="flex items-center gap-2">
+            <input type="number" step="0.01" min="0" value={cuotaMonto} onChange={(e) => setCuotaMonto(e.target.value)} className={inputCls} placeholder="0.00" />
+            <button
+              type="button"
+              onClick={handleCalcularCuota}
+              disabled={!monto || !numCuotas}
+              className="whitespace-nowrap rounded-lg border border-teal-600 px-3 py-2 text-xs font-medium text-teal-700 hover:bg-teal-50 disabled:opacity-40"
+            >
+              Calcular
+            </button>
+          </div>
+          {!!monto && !!numCuotas && (
+            <p className="mt-1 text-xs text-stone-400">
+              Sugerido: {fmt(cuotaCalculada, moneda)} / mes (sistema francés). Puedes ajustarlo manualmente.
+            </p>
+          )}
+        </Field>
+      </div>
+
       <button onClick={handleSubmit} disabled={!cuenta || !monto || !persona} className="mt-2 w-full rounded-lg bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-700 disabled:opacity-50">
         Guardar préstamo
+      </button>
+    </Modal>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Modal: Editar intereses y cuotas de un préstamo                     */
+/* ------------------------------------------------------------------ */
+
+function EditLoanModal({ loan, onClose, onSave }) {
+  const [tasaInteres, setTasaInteres] = useState(loan.tasaInteres || "");
+  const [numCuotas, setNumCuotas] = useState(loan.numCuotas || "");
+  const [cuotaMonto, setCuotaMonto] = useState(loan.cuotaMonto || "");
+  const [descripcion, setDescripcion] = useState(loan.descripcion || "");
+
+  const cuotaCalculada = calcCuota(loan.monto, tasaInteres, numCuotas);
+
+  const handleCalcularCuota = () => {
+    setCuotaMonto(cuotaCalculada ? cuotaCalculada.toFixed(2) : "");
+  };
+
+  const handleSubmit = () => {
+    onSave({
+      tasaInteres: Number(tasaInteres) || 0,
+      numCuotas: Number(numCuotas) || 0,
+      cuotaMonto: Number(cuotaMonto) || 0,
+      descripcion,
+    });
+  };
+
+  return (
+    <Modal title={`Editar préstamo con ${loan.persona}`} onClose={onClose}>
+      <div className="mb-4 rounded-xl border border-stone-200 bg-stone-50 p-3 text-sm text-stone-600">
+        Monto: <span className="font-mono font-semibold text-stone-900">{fmt(loan.monto, loan.moneda)}</span>
+      </div>
+
+      <div className="mb-4 grid grid-cols-2 gap-2">
+        <Field label="Tasa de interés anual (%)">
+          <input type="number" step="0.01" min="0" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} placeholder="Ej. 24" />
+        </Field>
+        <Field label="N° de cuotas">
+          <input type="number" step="1" min="0" value={numCuotas} onChange={(e) => setNumCuotas(e.target.value)} className={inputCls} placeholder="Ej. 12" />
+        </Field>
+      </div>
+
+      <Field label="Monto de la cuota">
+        <div className="flex items-center gap-2">
+          <input type="number" step="0.01" min="0" value={cuotaMonto} onChange={(e) => setCuotaMonto(e.target.value)} className={inputCls} placeholder="0.00" />
+          <button
+            type="button"
+            onClick={handleCalcularCuota}
+            disabled={!numCuotas}
+            className="whitespace-nowrap rounded-lg border border-teal-600 px-3 py-2 text-xs font-medium text-teal-700 hover:bg-teal-50 disabled:opacity-40"
+          >
+            Calcular
+          </button>
+        </div>
+        {!!numCuotas && (
+          <p className="mt-1 text-xs text-stone-400">
+            Sugerido: {fmt(cuotaCalculada, loan.moneda)} / mes (sistema francés). Puedes ajustarlo manualmente.
+          </p>
+        )}
+      </Field>
+
+      <Field label="Descripción (opcional)">
+        <input value={descripcion} onChange={(e) => setDescripcion(e.target.value)} className={inputCls} placeholder="Ej. para el pasaje del bus" />
+      </Field>
+
+      <button onClick={handleSubmit} className="mt-2 w-full rounded-lg bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-700">
+        Guardar cambios
       </button>
     </Modal>
   );
