@@ -114,7 +114,12 @@ const TRANSACTIONS_SEED = [];
 
 const CREDIT_CARDS_SEED = [];
 
+const LOANS_SEED = [];
+
 const DEFAULT_SETTINGS = { tipoCambio: 3.55 };
+
+const CURRENCY_LABEL = { PEN: "Soles", USD: "Dólares" };
+const CURRENCY_SYMBOL = { PEN: "S/", USD: "US$" };
 
 const GRUPO_COLORS = {
   "Instituto": "#0d9488", "Salud": "#dc2626", "Transporte": "#2563eb", "Servicios": "#7c3aed",
@@ -335,6 +340,37 @@ function ProgressBar({ pct, tone = "teal" }) {
   );
 }
 
+function ChipGroup({ options, value, onChange, getLabel = (o) => o, getKey = (o) => o }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {options.map((o) => {
+        const key = getKey(o);
+        const active = key === value;
+        return (
+          <button
+            key={key}
+            type="button"
+            onClick={() => onChange(key)}
+            className={`rounded-full border px-3.5 py-1.5 text-sm font-medium transition-colors ${
+              active ? "border-teal-600 bg-teal-600 text-white" : "border-stone-200 bg-white text-stone-600 hover:border-stone-300"
+            }`}
+          >
+            {getLabel(o)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function CurrencyBadge({ moneda }) {
+  return (
+    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${moneda === "USD" ? "bg-emerald-100 text-emerald-700" : "bg-sky-100 text-sky-700"}`}>
+      {CURRENCY_SYMBOL[moneda]}
+    </span>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /*  Pantalla de inicio de sesión                                        */
 /* ------------------------------------------------------------------ */
@@ -465,6 +501,7 @@ function Root() {
 }
 
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
 /*  App principal                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -474,12 +511,15 @@ function FinanceDashboard({ user }) {
   const [transactions, setTransactions] = useState(TRANSACTIONS_SEED);
   const [budgets, setBudgets] = useState(BUDGETS_SEED);
   const [cards, setCards] = useState(CREDIT_CARDS_SEED);
+  const [loans, setLoans] = useState(LOANS_SEED);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [tab, setTab] = useState("resumen");
   const [selectedMonth, setSelectedMonth] = useState(null);
   const [showTxModal, setShowTxModal] = useState(false);
   const [showCardModal, setShowCardModal] = useState(false);
   const [showAccModal, setShowAccModal] = useState(false);
+  const [showLoanModal, setShowLoanModal] = useState(false);
+  const [settlingLoan, setSettlingLoan] = useState(null);
   const [saveState, setSaveState] = useState("idle");
 
   // Cargar datos desde Firestore al iniciar sesión
@@ -491,6 +531,7 @@ function FinanceDashboard({ user }) {
         if (data.transactions) setTransactions(data.transactions);
         if (data.budgets) setBudgets(data.budgets);
         if (data.cards) setCards(data.cards);
+        if (data.loans) setLoans(data.loans);
         if (data.settings) setSettings(data.settings);
       }
       setLoaded(true);
@@ -502,25 +543,26 @@ function FinanceDashboard({ user }) {
     if (!loaded) return;
     setSaveState("saving");
     const t = setTimeout(async () => {
-      const ok = await cloudSave(user.uid, { accounts, transactions, budgets, cards, settings });
+      const ok = await cloudSave(user.uid, { accounts, transactions, budgets, cards, loans, settings });
       setSaveState(ok ? "saved" : "error");
     }, 500);
     return () => clearTimeout(t);
-  }, [accounts, transactions, budgets, cards, settings, loaded, user.uid]);
+  }, [accounts, transactions, budgets, cards, loans, settings, loaded, user.uid]);
 
-  const accountByName = useCallback((nombre) => accounts.find((a) => a.nombre === nombre), [accounts]);
+  const toSoles = useCallback((t) => (t.moneda === "USD" ? t.monto * settings.tipoCambio : t.monto), [settings.tipoCambio]);
 
   const accountBalances = useMemo(() => {
     const balances = {};
-    accounts.forEach((a) => (balances[a.nombre] = 0));
+    accounts.forEach((a) => (balances[a.nombre] = { PEN: 0, USD: 0 }));
     transactions.forEach((t) => {
-      if (balances[t.cuenta] === undefined) balances[t.cuenta] = 0;
-      if (t.tipo === "Ingreso") balances[t.cuenta] += t.monto;
-      else if (t.tipo === "Gasto") balances[t.cuenta] -= t.monto;
+      const m = t.moneda || "PEN";
+      if (!balances[t.cuenta]) balances[t.cuenta] = { PEN: 0, USD: 0 };
+      if (t.tipo === "Ingreso") balances[t.cuenta][m] += t.monto;
+      else if (t.tipo === "Gasto") balances[t.cuenta][m] -= t.monto;
       else if (t.tipo === "Transferencia") {
-        balances[t.cuenta] -= t.monto;
-        if (balances[t.cuentaDestino] === undefined) balances[t.cuentaDestino] = 0;
-        balances[t.cuentaDestino] += t.monto;
+        balances[t.cuenta][m] -= t.monto;
+        if (!balances[t.cuentaDestino]) balances[t.cuentaDestino] = { PEN: 0, USD: 0 };
+        balances[t.cuentaDestino][m] += t.monto;
       }
     });
     return balances;
@@ -544,31 +586,33 @@ function FinanceDashboard({ user }) {
   const realExpenseTx = monthTx.filter((t) => t.tipo === "Gasto" && t.grupo !== "Préstamos");
   const loanTx = monthTx.filter((t) => t.grupo === "Préstamos");
 
-  const ingresosMes = realIncomeTx.reduce((s, t) => s + t.monto, 0);
-  const gastosMes = realExpenseTx.reduce((s, t) => s + t.monto, 0);
+  const ingresosMes = realIncomeTx.reduce((s, t) => s + toSoles(t), 0);
+  const gastosMes = realExpenseTx.reduce((s, t) => s + toSoles(t), 0);
   const ahorroMes = ingresosMes - gastosMes;
   const pctAhorro = ingresosMes > 0 ? (ahorroMes / ingresosMes) * 100 : 0;
-  const prestado = loanTx.filter((t) => t.tipo === "Gasto").reduce((s, t) => s + t.monto, 0);
-  const cobrado = loanTx.filter((t) => t.tipo === "Ingreso").reduce((s, t) => s + t.monto, 0);
+  const prestado = loanTx.filter((t) => t.tipo === "Gasto").reduce((s, t) => s + toSoles(t), 0);
+  const cobrado = loanTx.filter((t) => t.tipo === "Ingreso").reduce((s, t) => s + toSoles(t), 0);
 
-  const totalPEN = accounts.filter((a) => a.moneda === "PEN").reduce((s, a) => s + (accountBalances[a.nombre] || 0), 0);
-  const totalUSD = accounts.filter((a) => a.moneda === "USD").reduce((s, a) => s + (accountBalances[a.nombre] || 0), 0);
+  const totalPEN = accounts.reduce((s, a) => s + (accountBalances[a.nombre]?.PEN || 0), 0);
+  const totalUSD = accounts.reduce((s, a) => s + (accountBalances[a.nombre]?.USD || 0), 0);
   const patrimonioSoles = totalPEN + totalUSD * settings.tipoCambio;
+
+  const deudaTarjetasSoles = cards.reduce(
+    (s, c) => s + (c.porMoneda?.PEN?.saldoActual || 0) + (c.porMoneda?.USD?.saldoActual || 0) * settings.tipoCambio,
+    0
+  );
 
   const gastosPorCategoria = useMemo(() => {
     const map = {};
     realExpenseTx.forEach((t) => {
-      map[t.categoria] = (map[t.categoria] || 0) + t.monto;
+      map[t.categoria] = (map[t.categoria] || 0) + toSoles(t);
     });
     return Object.entries(map)
       .map(([name, value]) => ({ name, value }))
       .sort((a, b) => b.value - a.value);
-  }, [realExpenseTx]);
+  }, [realExpenseTx, toSoles]);
 
-  const topGastos = useMemo(
-    () => [...realExpenseTx].sort((a, b) => b.monto - a.monto).slice(0, 5),
-    [realExpenseTx]
-  );
+  const topGastos = useMemo(() => [...realExpenseTx].sort((a, b) => toSoles(b) - toSoles(a)).slice(0, 5), [realExpenseTx, toSoles]);
 
   const evolucion6m = useMemo(() => {
     if (!selectedMonth) return [];
@@ -578,49 +622,66 @@ function FinanceDashboard({ user }) {
       const d = new Date(y, m - 1 - i, 1);
       const mk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
       const txs = transactions.filter((t) => monthKey(t.fecha) === mk);
-      const ing = txs.filter((t) => t.tipo === "Ingreso" && t.grupo !== "Balance" && t.grupo !== "Préstamos").reduce((s, t) => s + t.monto, 0);
-      const gas = txs.filter((t) => t.tipo === "Gasto" && t.grupo !== "Préstamos").reduce((s, t) => s + t.monto, 0);
+      const ing = txs.filter((t) => t.tipo === "Ingreso" && t.grupo !== "Balance" && t.grupo !== "Préstamos").reduce((s, t) => s + toSoles(t), 0);
+      const gas = txs.filter((t) => t.tipo === "Gasto" && t.grupo !== "Préstamos").reduce((s, t) => s + toSoles(t), 0);
       out.push({ mes: d.toLocaleDateString("es-PE", { month: "short" }), Ingresos: Number(ing.toFixed(2)), Gastos: Number(gas.toFixed(2)) });
     }
     return out;
-  }, [transactions, selectedMonth]);
+  }, [transactions, selectedMonth, toSoles]);
 
   const budgetsWithSpent = useMemo(
     () =>
       budgets.map((b) => {
-        const gastado = realExpenseTx.filter((t) => t.grupo === b.grupo && t.categoria === b.categoria).reduce((s, t) => s + t.monto, 0);
+        const gastado = realExpenseTx.filter((t) => t.grupo === b.grupo && t.categoria === b.categoria).reduce((s, t) => s + toSoles(t), 0);
         const pct = b.presupuesto > 0 ? (gastado / b.presupuesto) * 100 : gastado > 0 ? 100 : 0;
         return { ...b, gastado, pct, disponible: b.presupuesto - gastado };
       }),
-    [budgets, realExpenseTx]
+    [budgets, realExpenseTx, toSoles]
   );
 
   const cardsWithUtil = useMemo(
-    () => cards.map((c) => ({ ...c, util: c.limite > 0 ? (c.saldoActual / c.limite) * 100 : 0 })),
+    () =>
+      cards.map((c) => ({
+        ...c,
+        utilPEN: c.porMoneda?.PEN?.limite > 0 ? (c.porMoneda.PEN.saldoActual / c.porMoneda.PEN.limite) * 100 : 0,
+        utilUSD: c.porMoneda?.USD?.limite > 0 ? (c.porMoneda.USD.saldoActual / c.porMoneda.USD.limite) * 100 : 0,
+      })),
     [cards]
   );
+
+  const loansPendientes = loans.filter((l) => l.estado === "Pendiente");
+  const teDeben = { PEN: 0, USD: 0 };
+  const debes = { PEN: 0, USD: 0 };
+  loansPendientes.forEach((l) => {
+    if (l.tipo === "Presté") teDeben[l.moneda] += l.monto;
+    else debes[l.moneda] += l.monto;
+  });
 
   const alerts = useMemo(() => {
     const list = [];
     accounts.forEach((a) => {
-      const bal = accountBalances[a.nombre] || 0;
-      if (bal < 0) list.push({ type: "danger", text: `${a.nombre} tiene saldo negativo: ${fmt(bal, a.moneda)}` });
+      const bal = accountBalances[a.nombre] || { PEN: 0, USD: 0 };
+      (a.monedas || []).forEach((m) => {
+        if (bal[m] < 0) list.push({ type: "danger", text: `${a.nombre} tiene saldo negativo en ${CURRENCY_LABEL[m].toLowerCase()}: ${fmt(bal[m], m)}` });
+      });
     });
     budgetsWithSpent.forEach((b) => {
       if (b.presupuesto > 0 && b.pct >= 100) list.push({ type: "danger", text: `Presupuesto "${b.categoria}" excedido (${b.pct.toFixed(0)}%)` });
       else if (b.presupuesto > 0 && b.pct >= 80) list.push({ type: "warn", text: `Presupuesto "${b.categoria}" al ${b.pct.toFixed(0)}%` });
     });
     cardsWithUtil.forEach((c) => {
-      if (c.util >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.util.toFixed(0)}% de uso de línea` });
+      if (c.utilPEN >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.utilPEN.toFixed(0)}% de uso en soles` });
+      if (c.utilUSD >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.utilUSD.toFixed(0)}% de uso en dólares` });
       if (c.fechaPago) {
         const days = Math.ceil((new Date(c.fechaPago) - new Date()) / 86400000);
         if (days >= 0 && days <= 7) list.push({ type: "warn", text: `Pago de ${c.nombre} vence en ${days} día(s)` });
       }
     });
+    if (loansPendientes.length > 0) {
+      list.push({ type: "warn", text: `Tienes ${loansPendientes.length} préstamo(s) pendiente(s) de cobrar o pagar` });
+    }
     return list;
-  }, [accounts, accountBalances, budgetsWithSpent, cardsWithUtil]);
-
-  const deudaTarjetas = cards.reduce((s, c) => s + (Number(c.saldoActual) || 0), 0);
+  }, [accounts, accountBalances, budgetsWithSpent, cardsWithUtil, loansPendientes]);
 
   /* ---------------------------- Acciones --------------------------- */
 
@@ -637,12 +698,59 @@ function FinanceDashboard({ user }) {
     setTransactions((prev) => prev.filter((t) => t.cuenta !== acc.nombre && t.cuentaDestino !== acc.nombre));
   };
 
+  const addLoan = (form) => {
+    const txId = uid();
+    const tx = {
+      id: txId,
+      tipo: form.tipo === "Presté" ? "Gasto" : "Ingreso",
+      fecha: form.fecha,
+      cuenta: form.cuenta,
+      grupo: "Préstamos",
+      categoria: "Préstamos",
+      monto: form.monto,
+      moneda: form.moneda,
+      descripcion: form.descripcion || `${form.tipo} — ${form.persona}`,
+      recurrente: "NO",
+      persona: form.persona,
+    };
+    setTransactions((prev) => [tx, ...prev]);
+    setLoans((prev) => [
+      { id: uid(), persona: form.persona, tipo: form.tipo, monto: form.monto, moneda: form.moneda, cuenta: form.cuenta, fecha: form.fecha, descripcion: form.descripcion, estado: "Pendiente", txId },
+      ...prev,
+    ]);
+  };
+
+  const settleLoan = (loan, cuenta, fecha) => {
+    const txId = uid();
+    const tx = {
+      id: txId,
+      tipo: loan.tipo === "Presté" ? "Ingreso" : "Gasto",
+      fecha,
+      cuenta,
+      grupo: "Préstamos",
+      categoria: "Préstamos",
+      monto: loan.monto,
+      moneda: loan.moneda,
+      descripcion: `Liquidación préstamo con ${loan.persona}`,
+      recurrente: "NO",
+      persona: loan.persona,
+    };
+    setTransactions((prev) => [tx, ...prev]);
+    setLoans((prev) => prev.map((l) => (l.id === loan.id ? { ...l, estado: "Liquidado", fechaLiquidacion: fecha, liquidacionTxId: txId } : l)));
+    setSettlingLoan(null);
+  };
+
+  const deleteLoan = (loan) => {
+    setLoans((prev) => prev.filter((l) => l.id !== loan.id));
+    setTransactions((prev) => prev.filter((t) => t.id !== loan.txId && t.id !== loan.liquidacionTxId));
+  };
+
   const NAV = [
     { id: "resumen", label: "Resumen", icon: "LayoutDashboard" },
     { id: "transacciones", label: "Transacciones", icon: "Receipt" },
     { id: "presupuestos", label: "Presupuestos", icon: "PiggyBank" },
-    { id: "tarjetas", label: "Tarjetas de crédito", icon: "CreditCard" },
-    { id: "cuentas", label: "Cuentas", icon: "Wallet" },
+    { id: "prestamos", label: "Préstamos", icon: "HandCoins" },
+    { id: "cuentas", label: "Cuentas y tarjetas", icon: "Wallet" },
   ];
 
   if (!loaded) {
@@ -698,9 +806,7 @@ function FinanceDashboard({ user }) {
         {/* Header */}
         <div className="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 bg-white/90 px-6 py-4 backdrop-blur">
           <div>
-            <h1 className="font-serif text-xl text-stone-900">
-              {NAV.find((n) => n.id === tab)?.label}
-            </h1>
+            <h1 className="font-serif text-xl text-stone-900">{NAV.find((n) => n.id === tab)?.label}</h1>
             {selectedMonth && <p className="text-xs capitalize text-stone-500">{monthLabel(selectedMonth)}</p>}
           </div>
           <div className="flex items-center gap-2">
@@ -720,7 +826,6 @@ function FinanceDashboard({ user }) {
             <button
               onClick={() => (accounts.length ? setShowTxModal(true) : setTab("cuentas"))}
               className="flex items-center gap-1.5 rounded-lg bg-teal-600 px-3.5 py-2 text-sm font-medium text-white hover:bg-teal-700"
-              title={accounts.length ? "" : "Primero agrega una cuenta"}
             >
               <Ico name="Plus" size={16} /> Nuevo movimiento
             </button>
@@ -735,8 +840,8 @@ function FinanceDashboard({ user }) {
               </div>
               <h2 className="mb-1 font-serif text-lg text-stone-900">Empecemos desde cero</h2>
               <p className="mb-5 text-sm text-stone-500">
-                Primero agrega tus cuentas o billeteras (banco, efectivo, Yape, tarjeta prepago, etc.). Luego podrás
-                registrar movimientos, definir presupuestos y agregar tarjetas de crédito.
+                Primero agrega tus cuentas o billeteras (banco, efectivo, Yape, tarjeta prepago, etc.). Cada una puede
+                manejar soles, dólares, o ambos.
               </p>
               <button
                 onClick={() => setTab("cuentas")}
@@ -755,7 +860,7 @@ function FinanceDashboard({ user }) {
               patrimonioSoles={patrimonioSoles}
               totalPEN={totalPEN}
               totalUSD={totalUSD}
-              deudaTarjetas={deudaTarjetas}
+              deudaTarjetasSoles={deudaTarjetasSoles}
               prestado={prestado}
               cobrado={cobrado}
               gastosPorCategoria={gastosPorCategoria}
@@ -766,22 +871,28 @@ function FinanceDashboard({ user }) {
             />
           )}
           {tab === "transacciones" && (
-            <TransaccionesTab
-              transactions={[...transactions].sort((a, b) => (a.fecha < b.fecha ? 1 : -1))}
-              accounts={accounts}
-              onDelete={deleteTransaction}
-            />
+            <TransaccionesTab transactions={[...transactions].sort((a, b) => (a.fecha < b.fecha ? 1 : -1))} onDelete={deleteTransaction} />
           )}
           {tab === "presupuestos" && <PresupuestosTab budgetsWithSpent={budgetsWithSpent} onUpdate={updateBudget} />}
-          {tab === "tarjetas" && (
-            <TarjetasTab cardsWithUtil={cardsWithUtil} onAdd={() => setShowCardModal(true)} onDelete={deleteCard} />
+          {tab === "prestamos" && (
+            <PrestamosTab
+              loans={[...loans].sort((a, b) => (a.fecha < b.fecha ? 1 : -1))}
+              teDeben={teDeben}
+              debes={debes}
+              onAdd={() => setShowLoanModal(true)}
+              onSettle={(loan) => setSettlingLoan(loan)}
+              onDelete={deleteLoan}
+            />
           )}
           {tab === "cuentas" && (
             <CuentasTab
               accounts={accounts}
               accountBalances={accountBalances}
-              onAdd={() => setShowAccModal(true)}
-              onDelete={deleteAccount}
+              cardsWithUtil={cardsWithUtil}
+              onAddAccount={() => setShowAccModal(true)}
+              onDeleteAccount={deleteAccount}
+              onAddCard={() => setShowCardModal(true)}
+              onDeleteCard={deleteCard}
               settings={settings}
               setSettings={setSettings}
             />
@@ -817,6 +928,24 @@ function FinanceDashboard({ user }) {
           }}
         />
       )}
+      {showLoanModal && (
+        <LoanModal
+          accounts={accounts}
+          onClose={() => setShowLoanModal(false)}
+          onSave={(l) => {
+            addLoan(l);
+            setShowLoanModal(false);
+          }}
+        />
+      )}
+      {settlingLoan && (
+        <SettleLoanModal
+          loan={settlingLoan}
+          accounts={accounts.filter((a) => (a.monedas || []).includes(settlingLoan.moneda))}
+          onClose={() => setSettlingLoan(null)}
+          onConfirm={(cuenta, fecha) => settleLoan(settlingLoan, cuenta, fecha)}
+        />
+      )}
     </div>
   );
 }
@@ -827,7 +956,7 @@ function FinanceDashboard({ user }) {
 
 function ResumenTab({
   ingresosMes, gastosMes, ahorroMes, pctAhorro, patrimonioSoles, totalPEN, totalUSD,
-  deudaTarjetas, prestado, cobrado, gastosPorCategoria, evolucion6m, topGastos, alerts, settings,
+  deudaTarjetasSoles, prestado, cobrado, gastosPorCategoria, evolucion6m, topGastos, alerts, settings,
 }) {
   return (
     <div className="space-y-6">
@@ -835,17 +964,11 @@ function ResumenTab({
         <StatCard icon="Landmark" label="Patrimonio (S/ equiv.)" value={fmt(patrimonioSoles)} sub={`${fmt(totalPEN)} + ${fmt(totalUSD, "USD")}`} />
         <StatCard icon="TrendingUp" label="Ingresos del mes" value={fmt(ingresosMes)} tone="good" />
         <StatCard icon="TrendingDown" label="Gastos del mes" value={fmt(gastosMes)} tone="bad" />
-        <StatCard
-          icon="PiggyBank"
-          label="Ahorro del mes"
-          value={fmt(ahorroMes)}
-          sub={`${pctAhorro.toFixed(1)}% de tus ingresos`}
-          tone={ahorroMes >= 0 ? "good" : "bad"}
-        />
+        <StatCard icon="PiggyBank" label="Ahorro del mes" value={fmt(ahorroMes)} sub={`${pctAhorro.toFixed(1)}% de tus ingresos`} tone={ahorroMes >= 0 ? "good" : "bad"} />
       </div>
 
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-        <StatCard icon="CreditCard" label="Deuda en tarjetas" value={fmt(deudaTarjetas)} tone={deudaTarjetas > 0 ? "warn" : "default"} />
+        <StatCard icon="CreditCard" label="Deuda en tarjetas (S/ equiv.)" value={fmt(deudaTarjetasSoles)} tone={deudaTarjetasSoles > 0 ? "warn" : "default"} />
         <StatCard icon="HandCoins" label="Prestado este mes" value={fmt(prestado)} />
         <StatCard icon="HandCoins" label="Te devolvieron" value={fmt(cobrado)} tone="good" />
         <StatCard icon="ArrowLeftRight" label="Tipo de cambio USD" value={`S/ ${settings.tipoCambio.toFixed(2)}`} />
@@ -876,11 +999,7 @@ function ResumenTab({
           ) : (
             <>
               <DonutChart
-                data={gastosPorCategoria.map((c, i) => ({
-                  name: c.name,
-                  value: c.value,
-                  color: GRUPO_COLORS[c.name] || PALETTE[i % PALETTE.length],
-                }))}
+                data={gastosPorCategoria.map((c, i) => ({ name: c.name, value: c.value, color: GRUPO_COLORS[c.name] || PALETTE[i % PALETTE.length] }))}
                 size={190}
               />
               <ul className="mt-2 space-y-2">
@@ -903,7 +1022,7 @@ function ResumenTab({
         </div>
 
         <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm lg:col-span-3">
-          <h3 className="mb-3 font-serif text-base text-stone-800">Ingresos vs. gastos (últimos 6 meses)</h3>
+          <h3 className="mb-3 font-serif text-base text-stone-800">Ingresos vs. gastos (últimos 6 meses, en soles)</h3>
           <GroupedBarChart data={evolucion6m} seriesKeys={["Ingresos", "Gastos"]} colors={["#0d9488", "#e11d48"]} height={260} />
           <div className="mt-2 flex justify-center gap-4 text-xs text-stone-500">
             <span className="flex items-center gap-1.5">
@@ -926,12 +1045,14 @@ function ResumenTab({
               {topGastos.map((t) => (
                 <li key={t.id} className="flex items-center justify-between py-2.5">
                   <div>
-                    <div className="text-sm font-medium text-stone-800">{t.descripcion || t.categoria}</div>
+                    <div className="flex items-center gap-1.5 text-sm font-medium text-stone-800">
+                      {t.descripcion || t.categoria} <CurrencyBadge moneda={t.moneda || "PEN"} />
+                    </div>
                     <div className="text-xs text-stone-400">
                       {t.categoria} · {t.cuenta} · {t.fecha}
                     </div>
                   </div>
-                  <div className="font-mono text-sm font-semibold text-rose-700">{fmt(t.monto)}</div>
+                  <div className="font-mono text-sm font-semibold text-rose-700">{fmt(t.monto, t.moneda || "PEN")}</div>
                 </li>
               ))}
             </ul>
@@ -939,13 +1060,8 @@ function ResumenTab({
         </div>
 
         <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-sm">
-          <h3 className="mb-3 font-serif text-base text-stone-800">Evolución del saldo neto</h3>
-          <TrendLineChart
-            data={evolucion6m.map((d) => ({ mes: d.mes, Ahorro: Number((d.Ingresos - d.Gastos).toFixed(2)) }))}
-            dataKey="Ahorro"
-            height={220}
-            color="#0d9488"
-          />
+          <h3 className="mb-3 font-serif text-base text-stone-800">Evolución del saldo neto (soles)</h3>
+          <TrendLineChart data={evolucion6m.map((d) => ({ mes: d.mes, Ahorro: Number((d.Ingresos - d.Gastos).toFixed(2)) }))} dataKey="Ahorro" height={220} color="#0d9488" />
         </div>
       </div>
     </div>
@@ -962,19 +1078,7 @@ function TransaccionesTab({ transactions, onDelete }) {
 
   return (
     <div className="space-y-4">
-      <div className="flex gap-2">
-        {["Todos", "Ingreso", "Gasto", "Transferencia"].map((f) => (
-          <button
-            key={f}
-            onClick={() => setFilterTipo(f)}
-            className={`rounded-full px-3.5 py-1.5 text-xs font-medium ${
-              filterTipo === f ? "bg-stone-900 text-white" : "bg-white text-stone-600 border border-stone-200"
-            }`}
-          >
-            {f}
-          </button>
-        ))}
-      </div>
+      <ChipGroup options={["Todos", "Ingreso", "Gasto", "Transferencia"]} value={filterTipo} onChange={setFilterTipo} />
       <div className="overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-sm">
         <table className="w-full text-sm">
           <thead>
@@ -995,11 +1099,7 @@ function TransaccionesTab({ transactions, onDelete }) {
                 <td className="px-4 py-2.5">
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                      t.tipo === "Ingreso"
-                        ? "bg-emerald-50 text-emerald-700"
-                        : t.tipo === "Gasto"
-                        ? "bg-rose-50 text-rose-700"
-                        : "bg-blue-50 text-blue-700"
+                      t.tipo === "Ingreso" ? "bg-emerald-50 text-emerald-700" : t.tipo === "Gasto" ? "bg-rose-50 text-rose-700" : "bg-blue-50 text-blue-700"
                     }`}
                   >
                     {t.tipo}
@@ -1011,12 +1111,11 @@ function TransaccionesTab({ transactions, onDelete }) {
                   {t.cuentaDestino ? ` → ${t.cuentaDestino}` : ""}
                 </td>
                 <td className="max-w-[220px] truncate px-4 py-2.5 text-stone-500">{t.descripcion}</td>
-                <td
-                  className={`whitespace-nowrap px-4 py-2.5 text-right font-mono font-medium ${
-                    t.tipo === "Ingreso" ? "text-emerald-700" : t.tipo === "Gasto" ? "text-rose-700" : "text-blue-700"
-                  }`}
-                >
-                  {fmt(t.monto)}
+                <td className={`whitespace-nowrap px-4 py-2.5 text-right font-mono font-medium ${t.tipo === "Ingreso" ? "text-emerald-700" : t.tipo === "Gasto" ? "text-rose-700" : "text-blue-700"}`}>
+                  <span className="mr-1 align-middle">
+                    <CurrencyBadge moneda={t.moneda || "PEN"} />
+                  </span>
+                  {fmt(t.monto, t.moneda || "PEN")}
                 </td>
                 <td className="px-4 py-2.5 text-right">
                   <button onClick={() => onDelete(t.id)} className="rounded p-1 text-stone-300 hover:bg-rose-50 hover:text-rose-600">
@@ -1050,6 +1149,7 @@ function PresupuestosTab({ budgetsWithSpent, onUpdate }) {
 
   return (
     <div className="space-y-6">
+      <p className="text-xs text-stone-400">Los presupuestos y montos gastados se calculan en soles (los gastos en dólares se convierten con tu tipo de cambio).</p>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <StatCard icon="PiggyBank" label="Presupuesto total del mes" value={fmt(totalPresupuesto)} />
         <StatCard icon="TrendingDown" label="Gastado del presupuesto" value={fmt(totalGastado)} tone={totalGastado > totalPresupuesto ? "bad" : "default"} />
@@ -1088,61 +1188,92 @@ function PresupuestosTab({ budgetsWithSpent, onUpdate }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Tab: Tarjetas de crédito                                            */
+/*  Tab: Préstamos                                                      */
 /* ------------------------------------------------------------------ */
 
-function TarjetasTab({ cardsWithUtil, onAdd, onDelete }) {
+function MultiCurrencySum({ obj }) {
+  const parts = ["PEN", "USD"].filter((m) => obj[m] > 0);
+  if (parts.length === 0) return <span>{fmt(0)}</span>;
+  return <span>{parts.map((m) => fmt(obj[m], m)).join(" · ")}</span>;
+}
+
+function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete }) {
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <div className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
+          <div className="mb-1 flex items-center gap-2 text-stone-500">
+            <Ico name="TrendingUp" size={16} />
+            <span className="text-xs font-medium uppercase tracking-wide">Te deben (pendiente)</span>
+          </div>
+          <div className="font-mono text-xl font-semibold text-emerald-700">
+            <MultiCurrencySum obj={teDeben} />
+          </div>
+        </div>
+        <div className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
+          <div className="mb-1 flex items-center gap-2 text-stone-500">
+            <Ico name="TrendingDown" size={16} />
+            <span className="text-xs font-medium uppercase tracking-wide">Debes (pendiente)</span>
+          </div>
+          <div className="font-mono text-xl font-semibold text-rose-700">
+            <MultiCurrencySum obj={debes} />
+          </div>
+        </div>
+      </div>
+
       <button onClick={onAdd} className="flex items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-stone-800">
-        <Ico name="Plus" size={16} /> Agregar tarjeta
+        <Ico name="Plus" size={16} /> Nuevo préstamo
       </button>
 
-      {cardsWithUtil.length === 0 ? (
+      {loans.length === 0 ? (
         <div className="rounded-2xl border border-dashed border-stone-300 bg-white p-10 text-center text-stone-400">
-          Aún no registras tarjetas de crédito. Agrega la primera para ver su línea, deuda y vencimientos.
+          Aún no registras préstamos. Agrega uno cuando prestes o te presten dinero.
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {cardsWithUtil.map((c) => (
-            <div key={c.id} className="relative overflow-hidden rounded-2xl border border-stone-200 bg-gradient-to-br from-stone-900 to-stone-700 p-5 text-white shadow-sm">
-              <button onClick={() => onDelete(c.id)} className="absolute right-3 top-3 rounded p-1 text-stone-300 hover:bg-white/10 hover:text-white">
-                <Ico name="Trash2" size={14} />
-              </button>
-              <div className="text-xs uppercase tracking-wide text-stone-300">{c.banco}</div>
-              <div className="mb-4 font-serif text-lg">{c.nombre}</div>
-              <div className="mb-1 flex items-end justify-between">
-                <span className="text-xs text-stone-300">Saldo actual</span>
-                <span className="font-mono text-xl font-semibold">{fmt(c.saldoActual, c.moneda)}</span>
-              </div>
-              <div className="mb-3 text-xs text-stone-300">Línea: {fmt(c.limite, c.moneda)}</div>
-              <div className="mb-1 h-1.5 w-full overflow-hidden rounded-full bg-white/20">
-                <div
-                  className={`h-full rounded-full ${c.util >= 80 ? "bg-rose-400" : c.util >= 50 ? "bg-amber-400" : "bg-teal-400"}`}
-                  style={{ width: `${Math.min(100, c.util)}%` }}
-                />
-              </div>
-              <div className="mb-3 text-xs text-stone-300">{c.util.toFixed(0)}% utilizado</div>
-              <div className="grid grid-cols-2 gap-2 border-t border-white/10 pt-3 text-xs">
-                <div>
-                  <div className="text-stone-400">Fecha de corte</div>
-                  <div>{c.fechaCorte || "—"}</div>
-                </div>
-                <div>
-                  <div className="text-stone-400">Fecha de pago</div>
-                  <div>{c.fechaPago || "—"}</div>
-                </div>
-                <div>
-                  <div className="text-stone-400">Pago mínimo</div>
-                  <div>{c.pagoMinimo ? fmt(c.pagoMinimo, c.moneda) : "—"}</div>
-                </div>
-                <div>
-                  <div className="text-stone-400">TCEA</div>
-                  <div>{c.tasaInteres ? `${c.tasaInteres}%` : "—"}</div>
-                </div>
-              </div>
-            </div>
-          ))}
+        <div className="overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-sm">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-stone-200 bg-stone-50 text-left text-xs uppercase tracking-wide text-stone-500">
+                <th className="px-4 py-3">Persona</th>
+                <th className="px-4 py-3">Tipo</th>
+                <th className="px-4 py-3">Monto</th>
+                <th className="px-4 py-3">Fecha</th>
+                <th className="px-4 py-3">Estado</th>
+                <th className="px-4 py-3"></th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-stone-100">
+              {loans.map((l) => (
+                <tr key={l.id} className="hover:bg-stone-50">
+                  <td className="px-4 py-2.5 font-medium text-stone-800">{l.persona}</td>
+                  <td className="px-4 py-2.5">
+                    <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${l.tipo === "Presté" ? "bg-sky-50 text-sky-700" : "bg-purple-50 text-purple-700"}`}>
+                      {l.tipo === "Presté" ? "Yo presté" : "Me prestaron"}
+                    </span>
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-2.5 font-mono font-medium text-stone-800">{fmt(l.monto, l.moneda)}</td>
+                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">{l.fecha}</td>
+                  <td className="px-4 py-2.5">
+                    <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${l.estado === "Pendiente" ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}>
+                      {l.estado}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2.5 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      {l.estado === "Pendiente" && (
+                        <button onClick={() => onSettle(l)} className="rounded-lg border border-teal-600 px-2.5 py-1 text-xs font-medium text-teal-700 hover:bg-teal-50">
+                          Marcar liquidado
+                        </button>
+                      )}
+                      <button onClick={() => onDelete(l)} className="rounded p-1 text-stone-300 hover:bg-rose-50 hover:text-rose-600">
+                        <Ico name="Trash2" size={14} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </div>
@@ -1150,16 +1281,21 @@ function TarjetasTab({ cardsWithUtil, onAdd, onDelete }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Tab: Cuentas                                                        */
+/*  Tab: Cuentas y tarjetas de crédito (unificado)                      */
 /* ------------------------------------------------------------------ */
 
-function CuentasTab({ accounts, accountBalances, onAdd, onDelete, settings, setSettings }) {
+function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, onDeleteAccount, onAddCard, onDeleteCard, settings, setSettings }) {
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <button onClick={onAdd} className="flex items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-stone-800">
-          <Ico name="Plus" size={16} /> Agregar cuenta
-        </button>
+        <div className="flex gap-2">
+          <button onClick={onAddAccount} className="flex items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-stone-800">
+            <Ico name="Plus" size={16} /> Agregar cuenta
+          </button>
+          <button onClick={onAddCard} className="flex items-center gap-1.5 rounded-lg bg-stone-900 px-3.5 py-2 text-sm font-medium text-white hover:bg-stone-800">
+            <Ico name="Plus" size={16} /> Agregar tarjeta
+          </button>
+        </div>
         <label className="flex items-center gap-2 text-sm text-stone-600">
           Tipo de cambio USD → PEN
           <input
@@ -1172,54 +1308,126 @@ function CuentasTab({ accounts, accountBalances, onAdd, onDelete, settings, setS
         </label>
       </div>
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {accounts.map((a) => {
-          const bal = accountBalances[a.nombre] || 0;
-          return (
-            <div key={a.id} className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
-              <div className="mb-2 flex items-start justify-between">
-                <div>
-                  <div className="text-sm font-medium text-stone-800">{a.nombre}</div>
-                  <div className="text-xs text-stone-400">{a.tipo}</div>
+      <div>
+        <h3 className="mb-3 font-serif text-base text-stone-800">Cuentas y billeteras</h3>
+        {accounts.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-stone-300 bg-white p-8 text-center text-stone-400">Aún no tienes cuentas registradas.</div>
+        ) : (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {accounts.map((a) => {
+              const bal = accountBalances[a.nombre] || { PEN: 0, USD: 0 };
+              return (
+                <div key={a.id} className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
+                  <div className="mb-2 flex items-start justify-between">
+                    <div>
+                      <div className="text-sm font-medium text-stone-800">{a.nombre}</div>
+                      <div className="text-xs text-stone-400">{a.tipo}</div>
+                    </div>
+                    <button onClick={() => onDeleteAccount(a.id)} className="rounded p-1 text-stone-300 hover:bg-rose-50 hover:text-rose-600">
+                      <Ico name="Trash2" size={14} />
+                    </button>
+                  </div>
+                  <div className="space-y-1">
+                    {(a.monedas || ["PEN"]).map((m) => (
+                      <div key={m} className={`font-mono text-lg font-semibold ${bal[m] < 0 ? "text-rose-700" : "text-stone-900"}`}>
+                        {fmt(bal[m], m)}
+                      </div>
+                    ))}
+                  </div>
                 </div>
-                <button onClick={() => onDelete(a.id)} className="rounded p-1 text-stone-300 hover:bg-rose-50 hover:text-rose-600">
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div>
+        <h3 className="mb-3 font-serif text-base text-stone-800">Tarjetas de crédito</h3>
+        {cardsWithUtil.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-stone-300 bg-white p-8 text-center text-stone-400">Aún no registras tarjetas de crédito.</div>
+        ) : (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {cardsWithUtil.map((c) => (
+              <div key={c.id} className="relative overflow-hidden rounded-2xl border border-stone-200 bg-gradient-to-br from-stone-900 to-stone-700 p-5 text-white shadow-sm">
+                <button onClick={() => onDeleteCard(c.id)} className="absolute right-3 top-3 rounded p-1 text-stone-300 hover:bg-white/10 hover:text-white">
                   <Ico name="Trash2" size={14} />
                 </button>
+                <div className="text-xs uppercase tracking-wide text-stone-300">{c.banco}</div>
+                <div className="mb-4 font-serif text-lg">{c.nombre}</div>
+
+                {["PEN", "USD"].filter((m) => c.porMoneda?.[m]).map((m) => {
+                  const d = c.porMoneda[m];
+                  const util = m === "PEN" ? c.utilPEN : c.utilUSD;
+                  return (
+                    <div key={m} className="mb-3 border-t border-white/10 pt-3 first:border-0 first:pt-0">
+                      <div className="mb-1 flex items-end justify-between">
+                        <span className="text-xs text-stone-300">Saldo actual ({CURRENCY_LABEL[m]})</span>
+                        <span className="font-mono text-lg font-semibold">{fmt(d.saldoActual, m)}</span>
+                      </div>
+                      <div className="mb-1 text-xs text-stone-300">Línea: {fmt(d.limite, m)}</div>
+                      <div className="mb-1 h-1.5 w-full overflow-hidden rounded-full bg-white/20">
+                        <div className={`h-full rounded-full ${util >= 80 ? "bg-rose-400" : util >= 50 ? "bg-amber-400" : "bg-teal-400"}`} style={{ width: `${Math.min(100, util)}%` }} />
+                      </div>
+                      <div className="text-xs text-stone-300">{util.toFixed(0)}% utilizado{d.pagoMinimo ? ` · mín. ${fmt(d.pagoMinimo, m)}` : ""}</div>
+                    </div>
+                  );
+                })}
+
+                <div className="mt-3 grid grid-cols-2 gap-2 border-t border-white/10 pt-3 text-xs">
+                  <div>
+                    <div className="text-stone-400">Fecha de corte</div>
+                    <div>{c.fechaCorte || "—"}</div>
+                  </div>
+                  <div>
+                    <div className="text-stone-400">Fecha de pago</div>
+                    <div>{c.fechaPago || "—"}</div>
+                  </div>
+                  <div className="col-span-2">
+                    <div className="text-stone-400">TCEA</div>
+                    <div>{c.tasaInteres ? `${c.tasaInteres}%` : "—"}</div>
+                  </div>
+                </div>
               </div>
-              <div className={`font-mono text-xl font-semibold ${bal < 0 ? "text-rose-700" : "text-stone-900"}`}>{fmt(bal, a.moneda)}</div>
-            </div>
-          );
-        })}
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/*  Modales de creación                                                 */
+/*  Modal: Nuevo movimiento (rediseñado, con chips en vez de dropdowns) */
 /* ------------------------------------------------------------------ */
 
 function TransactionModal({ accounts, onClose, onSave }) {
   const [tipo, setTipo] = useState("Gasto");
+  const [moneda, setMoneda] = useState("PEN");
   const [fecha, setFecha] = useState(todayISO());
-  const [cuenta, setCuenta] = useState(accounts[0]?.nombre || "");
-  const [cuentaDestino, setCuentaDestino] = useState(accounts[1]?.nombre || "");
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [cuenta, setCuenta] = useState("");
+  const [cuentaDestino, setCuentaDestino] = useState("");
   const [grupo, setGrupo] = useState("Básicos");
   const [categoria, setCategoria] = useState(BASICOS_CATS[0]);
   const [monto, setMonto] = useState("");
   const [descripcion, setDescripcion] = useState("");
   const [recurrente, setRecurrente] = useState("NO");
 
-  const catOptions = grupo === "Básicos" ? BASICOS_CATS : grupo === "Deseo" ? DESEO_CATS : ["Préstamos"];
+  const cuentasDisponibles = accounts.filter((a) => (a.monedas || ["PEN"]).includes(moneda));
+
+  useEffect(() => {
+    if (!cuentasDisponibles.find((a) => a.nombre === cuenta)) setCuenta(cuentasDisponibles[0]?.nombre || "");
+  }, [moneda]);
 
   const grupoOptionsByTipo = {
-    Ingreso: ["Balance", "Otros ingresos", "Recarga Tarjeta", "Préstamos", "Sueldo", "Freelance"],
-    Gasto: ["Básicos", "Deseo", "Préstamos"],
+    Ingreso: ["Balance", "Otros ingresos", "Recarga Tarjeta", "Sueldo", "Freelance"],
+    Gasto: ["Básicos", "Deseo"],
     Transferencia: ["Transferencia"],
   };
+  const catOptions = grupo === "Básicos" ? BASICOS_CATS : DESEO_CATS;
 
   const handleSubmit = () => {
-    if (!monto || Number(monto) <= 0) return;
+    if (!monto || Number(monto) <= 0 || !cuenta) return;
     onSave({
       tipo,
       fecha,
@@ -1228,6 +1436,7 @@ function TransactionModal({ accounts, onClose, onSave }) {
       grupo: tipo === "Transferencia" ? "Transferencia" : grupo,
       categoria: tipo === "Gasto" ? categoria : grupo,
       monto: Number(monto),
+      moneda,
       descripcion,
       recurrente,
     });
@@ -1235,134 +1444,255 @@ function TransactionModal({ accounts, onClose, onSave }) {
 
   return (
     <Modal title="Nuevo movimiento" onClose={onClose}>
-      <Field label="Tipo">
-        <div className="flex gap-2">
-          {["Gasto", "Ingreso", "Transferencia"].map((t) => (
-            <button
-              key={t}
-              onClick={() => {
-                setTipo(t);
-                setGrupo(grupoOptionsByTipo[t][0]);
-              }}
-              className={`flex-1 rounded-lg border px-3 py-2 text-sm font-medium ${
-                tipo === t ? "border-teal-600 bg-teal-50 text-teal-700" : "border-stone-200 text-stone-500"
-              }`}
-            >
-              {t}
-            </button>
-          ))}
+      {/* Tipo: botones grandes con ícono */}
+      <div className="mb-4 grid grid-cols-3 gap-2">
+        {[
+          { v: "Gasto", icon: "TrendingDown", color: "rose" },
+          { v: "Ingreso", icon: "TrendingUp", color: "emerald" },
+          { v: "Transferencia", icon: "ArrowLeftRight", color: "blue" },
+        ].map((o) => (
+          <button
+            key={o.v}
+            type="button"
+            onClick={() => {
+              setTipo(o.v);
+              setGrupo(grupoOptionsByTipo[o.v][0]);
+              if (o.v === "Gasto") setCategoria(BASICOS_CATS[0]);
+            }}
+            className={`flex flex-col items-center gap-1.5 rounded-xl border-2 py-3 text-sm font-medium ${
+              tipo === o.v ? `border-${o.color}-600 bg-${o.color}-50 text-${o.color}-700` : "border-stone-200 text-stone-500"
+            }`}
+          >
+            <Ico name={o.icon} size={20} />
+            {o.v}
+          </button>
+        ))}
+      </div>
+
+      {/* Monto grande + moneda */}
+      <div className="mb-4 flex items-center gap-2 rounded-xl border border-stone-200 bg-stone-50 px-4 py-3">
+        <ChipGroup options={["PEN", "USD"]} value={moneda} onChange={setMoneda} getLabel={(m) => CURRENCY_SYMBOL[m]} />
+        <input
+          type="number"
+          step="0.01"
+          min="0"
+          autoFocus
+          value={monto}
+          onChange={(e) => setMonto(e.target.value)}
+          placeholder="0.00"
+          className="flex-1 bg-transparent text-right font-mono text-2xl font-semibold text-stone-900 outline-none"
+        />
+      </div>
+
+      {/* Fecha rápida */}
+      <Field label="Fecha">
+        <div className="flex flex-wrap items-center gap-2">
+          <ChipGroup
+            options={["hoy", "ayer", "otra"]}
+            value={fecha === todayISO() && !showDatePicker ? "hoy" : showDatePicker ? "otra" : "ayer"}
+            onChange={(v) => {
+              if (v === "hoy") {
+                setFecha(todayISO());
+                setShowDatePicker(false);
+              } else if (v === "ayer") {
+                const d = new Date();
+                d.setDate(d.getDate() - 1);
+                setFecha(d.toISOString().slice(0, 10));
+                setShowDatePicker(false);
+              } else {
+                setShowDatePicker(true);
+              }
+            }}
+            getLabel={(v) => (v === "hoy" ? "Hoy" : v === "ayer" ? "Ayer" : "Otra fecha")}
+          />
+          {showDatePicker && <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className={inputCls + " w-auto"} />}
         </div>
       </Field>
 
-      <Field label="Fecha">
-        <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className={inputCls} />
-      </Field>
-
+      {/* Cuenta(s) como chips */}
       <Field label={tipo === "Transferencia" ? "Cuenta de origen" : "Cuenta"}>
-        <select value={cuenta} onChange={(e) => setCuenta(e.target.value)} className={inputCls}>
-          {accounts.map((a) => (
-            <option key={a.id} value={a.nombre}>
-              {a.nombre}
-            </option>
-          ))}
-        </select>
+        {cuentasDisponibles.length === 0 ? (
+          <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[moneda].toLowerCase()}. Agrega una desde la pestaña Cuentas.</p>
+        ) : (
+          <ChipGroup options={cuentasDisponibles.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />
+        )}
       </Field>
 
       {tipo === "Transferencia" && (
         <Field label="Cuenta de destino">
-          <select value={cuentaDestino} onChange={(e) => setCuentaDestino(e.target.value)} className={inputCls}>
-            {accounts.map((a) => (
-              <option key={a.id} value={a.nombre}>
-                {a.nombre}
-              </option>
-            ))}
-          </select>
+          <ChipGroup options={cuentasDisponibles.filter((a) => a.nombre !== cuenta).map((a) => a.nombre)} value={cuentaDestino} onChange={setCuentaDestino} />
         </Field>
       )}
 
       {tipo !== "Transferencia" && (
-        <Field label="Grupo / categoría general">
-          <select
+        <Field label="Grupo">
+          <ChipGroup
+            options={grupoOptionsByTipo[tipo]}
             value={grupo}
-            onChange={(e) => {
-              setGrupo(e.target.value);
-              if (e.target.value === "Básicos") setCategoria(BASICOS_CATS[0]);
-              if (e.target.value === "Deseo") setCategoria(DESEO_CATS[0]);
+            onChange={(g) => {
+              setGrupo(g);
+              if (g === "Básicos") setCategoria(BASICOS_CATS[0]);
+              if (g === "Deseo") setCategoria(DESEO_CATS[0]);
             }}
-            className={inputCls}
-          >
-            {grupoOptionsByTipo[tipo].map((g) => (
-              <option key={g} value={g}>
-                {g}
-              </option>
-            ))}
-          </select>
+          />
         </Field>
       )}
 
-      {tipo === "Gasto" && (grupo === "Básicos" || grupo === "Deseo") && (
-        <Field label="Categoría específica (para presupuesto)">
-          <select value={categoria} onChange={(e) => setCategoria(e.target.value)} className={inputCls}>
-            {catOptions.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
+      {tipo === "Gasto" && (
+        <Field label="Categoría (para tu presupuesto)">
+          <ChipGroup options={catOptions} value={categoria} onChange={setCategoria} />
         </Field>
       )}
 
-      <Field label="Monto">
-        <input type="number" step="0.01" min="0" value={monto} onChange={(e) => setMonto(e.target.value)} className={inputCls} placeholder="0.00" />
-      </Field>
-
-      <Field label="Descripción">
+      <Field label="Descripción (opcional)">
         <input value={descripcion} onChange={(e) => setDescripcion(e.target.value)} className={inputCls} placeholder="Ej. almuerzo, pasaje, etc." />
       </Field>
 
       {tipo === "Gasto" && (
         <Field label="¿Es recurrente?">
-          <select value={recurrente} onChange={(e) => setRecurrente(e.target.value)} className={inputCls}>
-            {["NO", "SEMANAL", "MENSUAL", "ANUAL"].map((r) => (
-              <option key={r} value={r}>
-                {r}
-              </option>
-            ))}
-          </select>
+          <ChipGroup options={["NO", "SEMANAL", "MENSUAL", "ANUAL"]} value={recurrente} onChange={setRecurrente} />
         </Field>
       )}
 
-      <button onClick={handleSubmit} className="mt-2 w-full rounded-lg bg-teal-600 py-2.5 text-sm font-medium text-white hover:bg-teal-700">
+      <button
+        onClick={handleSubmit}
+        disabled={!cuenta || !monto}
+        className="mt-2 w-full rounded-lg bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-700 disabled:opacity-50"
+      >
         Guardar movimiento
       </button>
     </Modal>
   );
 }
 
+/* ------------------------------------------------------------------ */
+/*  Modal: Nuevo préstamo / Liquidar préstamo                           */
+/* ------------------------------------------------------------------ */
+
+function LoanModal({ accounts, onClose, onSave }) {
+  const [tipo, setTipo] = useState("Presté");
+  const [persona, setPersona] = useState("");
+  const [moneda, setMoneda] = useState("PEN");
+  const [monto, setMonto] = useState("");
+  const [fecha, setFecha] = useState(todayISO());
+  const [descripcion, setDescripcion] = useState("");
+  const cuentasDisponibles = accounts.filter((a) => (a.monedas || ["PEN"]).includes(moneda));
+  const [cuenta, setCuenta] = useState("");
+
+  useEffect(() => {
+    if (!cuentasDisponibles.find((a) => a.nombre === cuenta)) setCuenta(cuentasDisponibles[0]?.nombre || "");
+  }, [moneda]);
+
+  const handleSubmit = () => {
+    if (!persona || !monto || Number(monto) <= 0 || !cuenta) return;
+    onSave({ tipo, persona, monto: Number(monto), moneda, cuenta, fecha, descripcion });
+  };
+
+  return (
+    <Modal title="Nuevo préstamo" onClose={onClose}>
+      <Field label="Tipo">
+        <div className="grid grid-cols-2 gap-2">
+          {[
+            { v: "Presté", label: "Yo presté", sub: "Tu dinero sale de una cuenta" },
+            { v: "Me prestaron", label: "Me prestaron", sub: "El dinero entra a una cuenta" },
+          ].map((o) => (
+            <button
+              key={o.v}
+              type="button"
+              onClick={() => setTipo(o.v)}
+              className={`rounded-xl border-2 p-3 text-left text-sm ${tipo === o.v ? "border-teal-600 bg-teal-50" : "border-stone-200"}`}
+            >
+              <div className="font-medium text-stone-800">{o.label}</div>
+              <div className="text-xs text-stone-500">{o.sub}</div>
+            </button>
+          ))}
+        </div>
+      </Field>
+
+      <Field label="¿Con quién?">
+        <input value={persona} onChange={(e) => setPersona(e.target.value)} className={inputCls} placeholder="Nombre de la persona" />
+      </Field>
+
+      <div className="mb-4 flex items-center gap-2 rounded-xl border border-stone-200 bg-stone-50 px-4 py-3">
+        <ChipGroup options={["PEN", "USD"]} value={moneda} onChange={setMoneda} getLabel={(m) => CURRENCY_SYMBOL[m]} />
+        <input type="number" step="0.01" min="0" value={monto} onChange={(e) => setMonto(e.target.value)} placeholder="0.00" className="flex-1 bg-transparent text-right font-mono text-2xl font-semibold text-stone-900 outline-none" />
+      </div>
+
+      <Field label="Cuenta">
+        {cuentasDisponibles.length === 0 ? (
+          <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[moneda].toLowerCase()}.</p>
+        ) : (
+          <ChipGroup options={cuentasDisponibles.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />
+        )}
+      </Field>
+
+      <Field label="Fecha">
+        <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className={inputCls} />
+      </Field>
+
+      <Field label="Descripción (opcional)">
+        <input value={descripcion} onChange={(e) => setDescripcion(e.target.value)} className={inputCls} placeholder="Ej. para el pasaje del bus" />
+      </Field>
+
+      <button onClick={handleSubmit} disabled={!cuenta || !monto || !persona} className="mt-2 w-full rounded-lg bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-700 disabled:opacity-50">
+        Guardar préstamo
+      </button>
+    </Modal>
+  );
+}
+
+function SettleLoanModal({ loan, accounts, onClose, onConfirm }) {
+  const [cuenta, setCuenta] = useState(accounts[0]?.nombre || "");
+  const [fecha, setFecha] = useState(todayISO());
+
+  return (
+    <Modal title={`Liquidar préstamo con ${loan.persona}`} onClose={onClose}>
+      <p className="mb-4 text-sm text-stone-600">
+        {loan.tipo === "Presté" ? `${loan.persona} te devuelve ${fmt(loan.monto, loan.moneda)}. Elige a qué cuenta llega el dinero.` : `Le devuelves ${fmt(loan.monto, loan.moneda)} a ${loan.persona}. Elige de qué cuenta sale.`}
+      </p>
+      <Field label="Cuenta">
+        {accounts.length === 0 ? <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[loan.moneda].toLowerCase()}.</p> : <ChipGroup options={accounts.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />}
+      </Field>
+      <Field label="Fecha">
+        <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className={inputCls} />
+      </Field>
+      <button onClick={() => cuenta && onConfirm(cuenta, fecha)} disabled={!cuenta} className="mt-2 w-full rounded-lg bg-teal-600 py-2.5 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-50">
+        Confirmar liquidación
+      </button>
+    </Modal>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Modal: Nueva tarjeta de crédito (multi-moneda)                      */
+/* ------------------------------------------------------------------ */
+
 function CardModal({ onClose, onSave }) {
   const [nombre, setNombre] = useState("");
   const [banco, setBanco] = useState("");
-  const [moneda, setMoneda] = useState("PEN");
-  const [limite, setLimite] = useState("");
-  const [saldoActual, setSaldoActual] = useState("");
+  const [monedas, setMonedas] = useState(["PEN"]);
+  const [campos, setCampos] = useState({
+    PEN: { limite: "", saldoActual: "", pagoMinimo: "" },
+    USD: { limite: "", saldoActual: "", pagoMinimo: "" },
+  });
   const [fechaCorte, setFechaCorte] = useState("");
   const [fechaPago, setFechaPago] = useState("");
-  const [pagoMinimo, setPagoMinimo] = useState("");
   const [tasaInteres, setTasaInteres] = useState("");
 
+  const toggleMoneda = (m) => setMonedas((prev) => (prev.includes(m) ? (prev.length > 1 ? prev.filter((x) => x !== m) : prev) : [...prev, m]));
+  const setCampo = (m, campo, valor) => setCampos((prev) => ({ ...prev, [m]: { ...prev[m], [campo]: valor } }));
+
   const handleSubmit = () => {
-    if (!nombre || !limite) return;
-    onSave({
-      nombre,
-      banco,
-      moneda,
-      limite: Number(limite) || 0,
-      saldoActual: Number(saldoActual) || 0,
-      fechaCorte,
-      fechaPago,
-      pagoMinimo: Number(pagoMinimo) || 0,
-      tasaInteres: Number(tasaInteres) || 0,
+    if (!nombre) return;
+    const porMoneda = {};
+    monedas.forEach((m) => {
+      porMoneda[m] = {
+        limite: Number(campos[m].limite) || 0,
+        saldoActual: Number(campos[m].saldoActual) || 0,
+        pagoMinimo: Number(campos[m].pagoMinimo) || 0,
+      };
     });
+    onSave({ nombre, banco, monedas, porMoneda, fechaCorte, fechaPago, tasaInteres: Number(tasaInteres) || 0 });
   };
 
   return (
@@ -1373,26 +1703,44 @@ function CardModal({ onClose, onSave }) {
       <Field label="Banco / entidad">
         <input value={banco} onChange={(e) => setBanco(e.target.value)} className={inputCls} placeholder="Ej. BCP, Interbank, Falabella" />
       </Field>
-      <Field label="Moneda">
-        <select value={moneda} onChange={(e) => setMoneda(e.target.value)} className={inputCls}>
-          <option value="PEN">Soles (PEN)</option>
-          <option value="USD">Dólares (USD)</option>
-        </select>
+      <Field label="¿En qué monedas maneja saldo?">
+        <div className="flex gap-2">
+          {["PEN", "USD"].map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => toggleMoneda(m)}
+              className={`flex-1 rounded-lg border-2 py-2 text-sm font-medium ${monedas.includes(m) ? "border-teal-600 bg-teal-50 text-teal-700" : "border-stone-200 text-stone-500"}`}
+            >
+              {CURRENCY_LABEL[m]} ({CURRENCY_SYMBOL[m]})
+            </button>
+          ))}
+        </div>
+        <p className="mt-1 text-xs text-stone-400">Marca ambas si la tarjeta tiene línea y consumos en soles y en dólares por separado.</p>
       </Field>
-      <Field label="Línea de crédito">
-        <input type="number" step="0.01" value={limite} onChange={(e) => setLimite(e.target.value)} className={inputCls} />
-      </Field>
-      <Field label="Saldo actual (deuda)">
-        <input type="number" step="0.01" value={saldoActual} onChange={(e) => setSaldoActual(e.target.value)} className={inputCls} />
-      </Field>
+
+      {monedas.map((m) => (
+        <div key={m} className="mb-3 rounded-xl border border-stone-200 p-3">
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-stone-500">{CURRENCY_LABEL[m]}</div>
+          <div className="grid grid-cols-3 gap-2">
+            <Field label="Línea">
+              <input type="number" step="0.01" value={campos[m].limite} onChange={(e) => setCampo(m, "limite", e.target.value)} className={inputCls} />
+            </Field>
+            <Field label="Saldo (deuda)">
+              <input type="number" step="0.01" value={campos[m].saldoActual} onChange={(e) => setCampo(m, "saldoActual", e.target.value)} className={inputCls} />
+            </Field>
+            <Field label="Pago mínimo">
+              <input type="number" step="0.01" value={campos[m].pagoMinimo} onChange={(e) => setCampo(m, "pagoMinimo", e.target.value)} className={inputCls} />
+            </Field>
+          </div>
+        </div>
+      ))}
+
       <Field label="Fecha de corte">
         <input type="date" value={fechaCorte} onChange={(e) => setFechaCorte(e.target.value)} className={inputCls} />
       </Field>
       <Field label="Fecha límite de pago">
         <input type="date" value={fechaPago} onChange={(e) => setFechaPago(e.target.value)} className={inputCls} />
-      </Field>
-      <Field label="Pago mínimo">
-        <input type="number" step="0.01" value={pagoMinimo} onChange={(e) => setPagoMinimo(e.target.value)} className={inputCls} />
       </Field>
       <Field label="TCEA / tasa de interés anual (%)">
         <input type="number" step="0.01" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} />
@@ -1404,14 +1752,20 @@ function CardModal({ onClose, onSave }) {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/*  Modal: Nueva cuenta / billetera (multi-moneda)                      */
+/* ------------------------------------------------------------------ */
+
 function AccountModal({ onClose, onSave }) {
   const [nombre, setNombre] = useState("");
   const [tipo, setTipo] = useState("Banco");
-  const [moneda, setMoneda] = useState("PEN");
+  const [monedas, setMonedas] = useState(["PEN"]);
+
+  const toggleMoneda = (m) => setMonedas((prev) => (prev.includes(m) ? (prev.length > 1 ? prev.filter((x) => x !== m) : prev) : [...prev, m]));
 
   const handleSubmit = () => {
     if (!nombre) return;
-    onSave({ nombre, tipo, moneda });
+    onSave({ nombre, tipo, monedas });
   };
 
   return (
@@ -1420,19 +1774,22 @@ function AccountModal({ onClose, onSave }) {
         <input value={nombre} onChange={(e) => setNombre(e.target.value)} className={inputCls} placeholder="Ej. Plin, Bipay, Interbank" />
       </Field>
       <Field label="Tipo">
-        <select value={tipo} onChange={(e) => setTipo(e.target.value)} className={inputCls}>
-          {["Banco", "Efectivo", "Billetera digital", "Ahorros", "Prepago", "Cashback", "Inversión"].map((t) => (
-            <option key={t} value={t}>
-              {t}
-            </option>
-          ))}
-        </select>
+        <ChipGroup options={["Banco", "Efectivo", "Billetera digital", "Ahorros", "Prepago", "Cashback", "Inversión"]} value={tipo} onChange={setTipo} />
       </Field>
-      <Field label="Moneda">
-        <select value={moneda} onChange={(e) => setMoneda(e.target.value)} className={inputCls}>
-          <option value="PEN">Soles (PEN)</option>
-          <option value="USD">Dólares (USD)</option>
-        </select>
+      <Field label="¿En qué monedas maneja saldo?">
+        <div className="flex gap-2">
+          {["PEN", "USD"].map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => toggleMoneda(m)}
+              className={`flex-1 rounded-lg border-2 py-2 text-sm font-medium ${monedas.includes(m) ? "border-teal-600 bg-teal-50 text-teal-700" : "border-stone-200 text-stone-500"}`}
+            >
+              {CURRENCY_LABEL[m]} ({CURRENCY_SYMBOL[m]})
+            </button>
+          ))}
+        </div>
+        <p className="mt-1 text-xs text-stone-400">Marca ambas si, por ejemplo, tu cuenta bancaria tiene una caja de ahorro en soles y otra en dólares.</p>
       </Field>
       <button onClick={handleSubmit} className="mt-2 w-full rounded-lg bg-teal-600 py-2.5 text-sm font-medium text-white hover:bg-teal-700">
         Guardar cuenta
@@ -1442,7 +1799,7 @@ function AccountModal({ onClose, onSave }) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Montaje de la app                                                   */
+/*  Montaje de la app                                                    */
 /* ------------------------------------------------------------------ */
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
