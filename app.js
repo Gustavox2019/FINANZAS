@@ -69,6 +69,7 @@ const ICON_PATHS = {
   Landmark: "M3 21h18M4 10h16M12 3l9 5H3zM6 10v8M10 10v8M14 10v8M18 10v8",
   ChevronDown: "M6 9l6 6 6-6",
   Check: "M20 6L9 17l-5-5",
+  Search: "M11 19a8 8 0 100-16 8 8 0 000 16zM21 21l-4.35-4.35",
 };
 
 function Ico({ name, size = 16, className = "" }) {
@@ -170,19 +171,28 @@ const calcCuota = (monto, tasa, numCuotas, tipoTasa = "anual") => {
 
 // Arma un link de "agregar evento" de Google Calendar (evento de un día, sin
 // necesidad de iniciar sesión ni de una integración OAuth) para recordar la
-// fecha de pago de un préstamo.
-const googleCalendarLink = (loan) => {
-  if (!loan.fechaPago) return "";
-  const start = loan.fechaPago.replace(/-/g, "");
-  const endDate = new Date(loan.fechaPago);
+// fecha de pago de un préstamo o de una tarjeta de crédito.
+const googleCalendarLink = ({ fechaPago, tipo, persona, nombre, monto, moneda, numCuotas, cuotaMonto, tasaInteres, tipoTasa, porMoneda }) => {
+  if (!fechaPago) return "";
+  const start = fechaPago.replace(/-/g, "");
+  const endDate = new Date(fechaPago);
   endDate.setDate(endDate.getDate() + 1);
   const end = endDate.toISOString().slice(0, 10).replace(/-/g, "");
-  const accion = loan.tipo === "Presté" ? "Cobrar" : "Pagar";
-  const cuotaTxto = loan.numCuotas ? ` (cuota ${fmt(loan.cuotaMonto || calcCuota(loan.monto, loan.tasaInteres, loan.numCuotas, loan.tipoTasa), loan.moneda)})` : "";
-  const text = encodeURIComponent(`${accion} préstamo — ${loan.persona}${cuotaTxto}`);
-  const details = encodeURIComponent(
-    `Préstamo registrado en Control de Dinero.\nMonto: ${fmt(loan.monto, loan.moneda)}${loan.numCuotas ? `\nCuotas: ${loan.numCuotas}` : ""}${loan.tasaInteres ? `\nTasa: ${loan.tasaInteres}% (${loan.tipoTasa === "mensual" ? "TCEM" : "TCEA"})` : ""}`
-  );
+  let text, details;
+  if (nombre) {
+    // Tarjeta de crédito
+    const deuda = (porMoneda?.PEN?.saldoActual || 0) > 0 ? fmt(porMoneda.PEN.saldoActual, "PEN") : fmt(porMoneda?.USD?.saldoActual || 0, "USD");
+    text = encodeURIComponent(`Pagar tarjeta ${nombre}`);
+    details = encodeURIComponent(`Recordatorio de pago de tarjeta de crédito registrado en Control de Dinero.\nSaldo: ${deuda}`);
+  } else {
+    // Préstamo
+    const accion = tipo === "Presté" ? "Cobrar" : "Pagar";
+    const cuotaTxto = numCuotas ? ` (cuota ${fmt(cuotaMonto || calcCuota(monto, tasaInteres, numCuotas, tipoTasa), moneda)})` : "";
+    text = encodeURIComponent(`${accion} préstamo — ${persona}${cuotaTxto}`);
+    details = encodeURIComponent(
+      `Préstamo registrado en Control de Dinero.\nMonto: ${fmt(monto, moneda)}${numCuotas ? `\nCuotas: ${numCuotas}` : ""}${tasaInteres ? `\nTasa: ${tasaInteres}% (${tipoTasa === "mensual" ? "TCEM" : "TCEA"})` : ""}`
+    );
+  }
   return `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${text}&dates=${start}/${end}&details=${details}`;
 };
 
@@ -693,11 +703,17 @@ function FinanceDashboard({ user }) {
 
   const cardsWithUtil = useMemo(
     () =>
-      cards.map((c) => ({
-        ...c,
-        utilPEN: c.porMoneda?.PEN?.limite > 0 ? (c.porMoneda.PEN.saldoActual / c.porMoneda.PEN.limite) * 100 : 0,
-        utilUSD: c.porMoneda?.USD?.limite > 0 ? (c.porMoneda.USD.saldoActual / c.porMoneda.USD.limite) * 100 : 0,
-      })),
+      cards.map((c) => {
+        let diasPago = null;
+        if (c.fechaPago) diasPago = Math.ceil((new Date(c.fechaPago + "T00:00:00") - new Date(new Date().toDateString())) / 86400000);
+        return {
+          ...c,
+          utilPEN: c.porMoneda?.PEN?.limite > 0 ? (c.porMoneda.PEN.saldoActual / c.porMoneda.PEN.limite) * 100 : 0,
+          utilUSD: c.porMoneda?.USD?.limite > 0 ? (c.porMoneda.USD.saldoActual / c.porMoneda.USD.limite) * 100 : 0,
+          diasPago,
+          vencido: diasPago !== null && diasPago < 0,
+        };
+      }),
     [cards]
   );
 
@@ -708,6 +724,12 @@ function FinanceDashboard({ user }) {
     if (l.tipo === "Presté") teDeben[l.moneda] += l.monto;
     else debes[l.moneda] += l.monto;
   });
+
+  // Patrimonio neto real = efectivo en cuentas + lo que te deben - lo que debes - deuda en tarjetas.
+  // Ignorar las deudas al calcular "patrimonio" da una foto falsa de la situación financiera.
+  const teDebenSoles = teDeben.PEN + teDeben.USD * settings.tipoCambio;
+  const debesSoles = debes.PEN + debes.USD * settings.tipoCambio;
+  const patrimonioNeto = patrimonioSoles + teDebenSoles - debesSoles - deudaTarjetasSoles;
 
   const alerts = useMemo(() => {
     const list = [];
@@ -724,13 +746,21 @@ function FinanceDashboard({ user }) {
     cardsWithUtil.forEach((c) => {
       if (c.utilPEN >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.utilPEN.toFixed(0)}% de uso en soles` });
       if (c.utilUSD >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.utilUSD.toFixed(0)}% de uso en dólares` });
-      if (c.fechaPago) {
-        const days = Math.ceil((new Date(c.fechaPago) - new Date()) / 86400000);
-        if (days >= 0 && days <= 7) list.push({ type: "warn", text: `Pago de ${c.nombre} vence en ${days} día(s)` });
+      if (c.diasPago !== null) {
+        if (c.vencido) list.push({ type: "danger", text: `Pago de ${c.nombre} vencido hace ${Math.abs(c.diasPago)} día(s)` });
+        else if (c.diasPago <= 7) list.push({ type: "warn", text: `Pago de ${c.nombre} vence en ${c.diasPago} día(s)` });
       }
     });
-    if (loansPendientes.length > 0) {
-      list.push({ type: "warn", text: `Tienes ${loansPendientes.length} préstamo(s) pendiente(s) de cobrar o pagar` });
+    loansPendientes.forEach((l) => {
+      if (!l.fechaPago) return;
+      const days = Math.ceil((new Date(l.fechaPago + "T00:00:00") - new Date(new Date().toDateString())) / 86400000);
+      const accion = l.tipo === "Presté" ? "Cobrar a" : "Pagarle a";
+      if (days < 0) list.push({ type: "danger", text: `${accion} ${l.persona} — pago vencido hace ${Math.abs(days)} día(s)` });
+      else if (days <= 7) list.push({ type: "warn", text: `${accion} ${l.persona} — pago vence en ${days} día(s)` });
+    });
+    const loansPendientesSinFecha = loansPendientes.filter((l) => !l.fechaPago).length;
+    if (loansPendientesSinFecha > 0) {
+      list.push({ type: "warn", text: `Tienes ${loansPendientesSinFecha} préstamo(s) pendiente(s) sin fecha de pago registrada` });
     }
     return list;
   }, [accounts, accountBalances, budgetsWithSpent, cardsWithUtil, loansPendientes]);
@@ -928,6 +958,7 @@ function FinanceDashboard({ user }) {
               ahorroMes={ahorroMes}
               pctAhorro={pctAhorro}
               patrimonioSoles={patrimonioSoles}
+              patrimonioNeto={patrimonioNeto}
               totalPEN={totalPEN}
               totalUSD={totalUSD}
               deudaTarjetasSoles={deudaTarjetasSoles}
@@ -1036,13 +1067,19 @@ function FinanceDashboard({ user }) {
 /* ------------------------------------------------------------------ */
 
 function ResumenTab({
-  ingresosMes, gastosMes, ahorroMes, pctAhorro, patrimonioSoles, totalPEN, totalUSD,
+  ingresosMes, gastosMes, ahorroMes, pctAhorro, patrimonioSoles, patrimonioNeto, totalPEN, totalUSD,
   deudaTarjetasSoles, prestado, cobrado, gastosPorCategoria, evolucion6m, topGastos, alerts, settings,
 }) {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-        <StatCard icon="Landmark" label="Patrimonio (S/ equiv.)" value={fmt(patrimonioSoles)} sub={`${fmt(totalPEN)} + ${fmt(totalUSD, "USD")}`} />
+        <StatCard
+          icon="Landmark"
+          label="Patrimonio neto (S/ equiv.)"
+          value={fmt(patrimonioNeto)}
+          sub={`Efectivo: ${fmt(patrimonioSoles)}`}
+          tone={patrimonioNeto >= 0 ? "good" : "bad"}
+        />
         <StatCard icon="TrendingUp" label="Ingresos del mes" value={fmt(ingresosMes)} tone="good" />
         <StatCard icon="TrendingDown" label="Gastos del mes" value={fmt(gastosMes)} tone="bad" />
         <StatCard icon="PiggyBank" label="Ahorro del mes" value={fmt(ahorroMes)} sub={`${pctAhorro.toFixed(1)}% de tus ingresos`} tone={ahorroMes >= 0 ? "good" : "bad"} />
@@ -1155,11 +1192,29 @@ function ResumenTab({
 
 function TransaccionesTab({ transactions, onDelete }) {
   const [filterTipo, setFilterTipo] = useState("Todos");
-  const filtered = filterTipo === "Todos" ? transactions : transactions.filter((t) => t.tipo === filterTipo);
+  const [busqueda, setBusqueda] = useState("");
+  const filtered = transactions
+    .filter((t) => filterTipo === "Todos" || t.tipo === filterTipo)
+    .filter((t) => {
+      if (!busqueda.trim()) return true;
+      const q = busqueda.trim().toLowerCase();
+      return [t.descripcion, t.categoria, t.cuenta, t.cuentaDestino, t.persona].filter(Boolean).some((v) => v.toLowerCase().includes(q));
+    });
 
   return (
     <div className="space-y-4">
-      <ChipGroup options={["Todos", "Ingreso", "Gasto", "Transferencia"]} value={filterTipo} onChange={setFilterTipo} />
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <ChipGroup options={["Todos", "Ingreso", "Gasto", "Transferencia"]} value={filterTipo} onChange={setFilterTipo} />
+        <div className="relative w-full sm:w-64">
+          <Ico name="Search" size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
+          <input
+            value={busqueda}
+            onChange={(e) => setBusqueda(e.target.value)}
+            placeholder="Buscar por descripción, categoría, cuenta…"
+            className="w-full rounded-lg border border-stone-300 bg-white py-2 pl-9 pr-3 text-sm outline-none focus:border-teal-600 focus:ring-1 focus:ring-teal-600"
+          />
+        </div>
+      </div>
       <div className="overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-sm">
         <table className="w-full text-sm">
           <thead>
@@ -1278,6 +1333,20 @@ function MultiCurrencySum({ obj }) {
   return <span>{parts.map((m) => fmt(obj[m], m)).join(" · ")}</span>;
 }
 
+// Deriva los datos financieros de un préstamo: cuota, costo total del crédito
+// (intereses), y estado del próximo pago (días restantes / vencido).
+function loanMeta(l) {
+  const cuota = l.cuotaMonto || calcCuota(l.monto, l.tasaInteres, l.numCuotas, l.tipoTasa);
+  const totalAPagar = l.numCuotas > 0 ? cuota * l.numCuotas : l.monto;
+  const interesTotal = Math.max(0, totalAPagar - l.monto);
+  let diasPago = null;
+  if (l.fechaPago) {
+    diasPago = Math.ceil((new Date(l.fechaPago + "T00:00:00") - new Date(new Date().toDateString())) / 86400000);
+  }
+  const vencido = l.estado === "Pendiente" && diasPago !== null && diasPago < 0;
+  return { cuota, totalAPagar, interesTotal, diasPago, vencido };
+}
+
 function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete, onEdit }) {
   return (
     <div className="space-y-6">
@@ -1311,83 +1380,85 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete, onEdit
           Aún no registras préstamos. Agrega uno cuando prestes o te presten dinero.
         </div>
       ) : (
-        <div className="overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-sm">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-stone-200 bg-stone-50 text-left text-xs uppercase tracking-wide text-stone-500">
-                <th className="px-4 py-3">Persona</th>
-                <th className="px-4 py-3">Tipo</th>
-                <th className="px-4 py-3">Monto</th>
-                <th className="px-4 py-3">Interés</th>
-                <th className="px-4 py-3">Cuotas</th>
-                <th className="px-4 py-3">Fecha</th>
-                <th className="px-4 py-3">Pago</th>
-                <th className="px-4 py-3">Estado</th>
-                <th className="px-4 py-3"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-stone-100">
-              {loans.map((l) => (
-                <tr key={l.id} className="hover:bg-stone-50">
-                  <td className="px-4 py-2.5 font-medium text-stone-800">{l.persona}</td>
-                  <td className="px-4 py-2.5">
-                    <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${l.tipo === "Presté" ? "bg-sky-50 text-sky-700" : "bg-purple-50 text-purple-700"}`}>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {loans.map((l) => {
+            const { cuota, totalAPagar, interesTotal, diasPago, vencido } = loanMeta(l);
+            const estadoLabel = vencido ? "Vencido" : l.estado;
+            const estadoTone = vencido
+              ? "bg-rose-50 text-rose-700"
+              : l.estado === "Pendiente"
+              ? "bg-amber-50 text-amber-700"
+              : "bg-emerald-50 text-emerald-700";
+            return (
+              <div key={l.id} className={`relative flex flex-col rounded-2xl border bg-white p-4 shadow-sm ${vencido ? "border-rose-300" : "border-stone-200"}`}>
+                <div className="mb-2 flex items-start justify-between gap-2">
+                  <div>
+                    <div className="font-serif text-base text-stone-900">{l.persona}</div>
+                    <span className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${l.tipo === "Presté" ? "bg-sky-50 text-sky-700" : "bg-purple-50 text-purple-700"}`}>
                       {l.tipo === "Presté" ? "Yo presté" : "Me prestaron"}
                     </span>
-                  </td>
-                  <td className="whitespace-nowrap px-4 py-2.5 font-mono font-medium text-stone-800">{fmt(l.monto, l.moneda)}</td>
-                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">
-                    {l.tasaInteres ? `${l.tasaInteres}% ${l.tipoTasa === "mensual" ? "TCEM" : "TCEA"}` : "—"}
-                  </td>
-                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">
-                    {l.numCuotas ? (
-                      <span>
-                        {l.numCuotas} × {fmt(l.cuotaMonto || calcCuota(l.monto, l.tasaInteres, l.numCuotas, l.tipoTasa), l.moneda)}
-                      </span>
-                    ) : (
-                      "—"
-                    )}
-                  </td>
-                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">{l.fecha}</td>
-                  <td className="whitespace-nowrap px-4 py-2.5 text-stone-500">
-                    {l.fechaPago ? (
-                      <a
-                        href={googleCalendarLink(l)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1 text-teal-700 hover:underline"
-                        title="Agregar a Google Calendar"
-                      >
-                        {l.fechaPago}
-                      </a>
-                    ) : (
-                      "—"
-                    )}
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${l.estado === "Pendiente" ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700"}`}>
-                      {l.estado}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5 text-right">
-                    <div className="flex items-center justify-end gap-2">
-                      <button onClick={() => onEdit(l)} className="rounded p-1 text-stone-300 hover:bg-teal-50 hover:text-teal-600" title="Editar interés y cuotas">
-                        <Ico name="Pencil" size={14} />
-                      </button>
-                      {l.estado === "Pendiente" && (
-                        <button onClick={() => onSettle(l)} className="rounded-lg border border-teal-600 px-2.5 py-1 text-xs font-medium text-teal-700 hover:bg-teal-50">
-                          Marcar liquidado
-                        </button>
-                      )}
-                      <button onClick={() => onDelete(l)} className="rounded p-1 text-stone-300 hover:bg-rose-50 hover:text-rose-600">
-                        <Ico name="Trash2" size={14} />
-                      </button>
+                  </div>
+                  <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${estadoTone}`}>{estadoLabel}</span>
+                </div>
+
+                <div className="mb-3 font-mono text-2xl font-semibold text-stone-900">{fmt(l.monto, l.moneda)}</div>
+
+                {l.numCuotas > 0 && (
+                  <div className="mb-3 space-y-1 rounded-xl bg-stone-50 p-3 text-xs">
+                    <div className="flex justify-between text-stone-500">
+                      <span>Cuota mensual</span>
+                      <span className="font-mono font-medium text-stone-800">{fmt(cuota, l.moneda)} × {l.numCuotas}</span>
                     </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                    <div className="flex justify-between text-stone-500">
+                      <span>Tasa</span>
+                      <span className="font-medium text-stone-800">{l.tasaInteres}% {l.tipoTasa === "mensual" ? "TCEM" : "TCEA"}</span>
+                    </div>
+                    <div className="flex justify-between text-stone-500">
+                      <span>Costo del crédito (interés)</span>
+                      <span className="font-mono font-medium text-amber-700">{fmt(interesTotal, l.moneda)}</span>
+                    </div>
+                    <div className="flex justify-between border-t border-stone-200 pt-1 text-stone-600">
+                      <span className="font-medium">Total a pagar</span>
+                      <span className="font-mono font-semibold text-stone-900">{fmt(totalAPagar, l.moneda)}</span>
+                    </div>
+                  </div>
+                )}
+
+                <div className="mb-3 flex items-center justify-between text-xs text-stone-500">
+                  <span>Registrado el {l.fecha}</span>
+                  {l.fechaPago && (
+                    <a
+                      href={googleCalendarLink(l)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={`inline-flex items-center gap-1 font-medium hover:underline ${vencido ? "text-rose-600" : "text-teal-700"}`}
+                      title="Agregar a Google Calendar"
+                    >
+                      <Ico name="Landmark" size={12} />
+                      {l.fechaPago}
+                      {diasPago !== null && l.estado === "Pendiente" && (
+                        <span>{vencido ? ` (venció hace ${Math.abs(diasPago)}d)` : diasPago === 0 ? " (hoy)" : ` (en ${diasPago}d)`}</span>
+                      )}
+                    </a>
+                  )}
+                </div>
+
+                <div className="mt-auto flex items-center justify-end gap-2 border-t border-stone-100 pt-3">
+                  <button onClick={() => onEdit(l)} className="rounded p-1.5 text-stone-300 hover:bg-teal-50 hover:text-teal-600" title="Editar interés, cuotas y fecha de pago">
+                    <Ico name="Pencil" size={14} />
+                  </button>
+                  {l.estado === "Pendiente" && (
+                    <button onClick={() => onSettle(l)} className="rounded-lg border border-teal-600 px-2.5 py-1 text-xs font-medium text-teal-700 hover:bg-teal-50">
+                      Marcar liquidado
+                    </button>
+                  )}
+                  <button onClick={() => onDelete(l)} className="rounded p-1.5 text-stone-300 hover:bg-rose-50 hover:text-rose-600">
+                    <Ico name="Trash2" size={14} />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -1462,7 +1533,7 @@ function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, on
         ) : (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {cardsWithUtil.map((c) => (
-              <div key={c.id} className="relative overflow-hidden rounded-2xl border border-stone-200 bg-gradient-to-br from-stone-900 to-stone-700 p-5 text-white shadow-sm">
+              <div key={c.id} className={`relative overflow-hidden rounded-2xl border p-5 text-white shadow-sm ${c.vencido ? "border-rose-400 bg-gradient-to-br from-rose-900 to-stone-800" : "border-stone-200 bg-gradient-to-br from-stone-900 to-stone-700"}`}>
                 <button onClick={() => onDeleteCard(c.id)} className="absolute right-3 top-3 rounded p-1 text-stone-300 hover:bg-white/10 hover:text-white">
                   <Ico name="Trash2" size={14} />
                 </button>
@@ -1494,7 +1565,22 @@ function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, on
                   </div>
                   <div>
                     <div className="text-stone-400">Fecha de pago</div>
-                    <div>{c.fechaPago || "—"}</div>
+                    {c.fechaPago ? (
+                      <a
+                        href={googleCalendarLink(c)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className={`inline-flex items-center gap-1 font-medium hover:underline ${c.vencido ? "text-rose-300" : "text-teal-300"}`}
+                        title="Agregar a Google Calendar"
+                      >
+                        {c.fechaPago}
+                        {c.diasPago !== null && (
+                          <span>{c.vencido ? ` (venció hace ${Math.abs(c.diasPago)}d)` : c.diasPago === 0 ? " (hoy)" : ` (en ${c.diasPago}d)`}</span>
+                        )}
+                      </a>
+                    ) : (
+                      "—"
+                    )}
                   </div>
                   <div className="col-span-2">
                     <div className="text-stone-400">TCEA</div>
