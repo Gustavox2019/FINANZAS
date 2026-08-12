@@ -158,24 +158,43 @@ function calcularCuotaMensual(monto, tasaAnualPct, numCuotas) {
   return (monto * tasaMensual) / (1 - Math.pow(1 + tasaMensual, -numCuotas));
 }
 
-// A partir de la fecha de la primera cuota, calcula cuál cuota (1..N) es la próxima por vencer.
-function proximaCuotaInfo(loan) {
-  if (!loan.numCuotas || !loan.fechaPrimeraCuota) return null;
-  const start = new Date(loan.fechaPrimeraCuota + "T00:00:00");
-  const today = new Date();
-  let idx = loan.numCuotas;
-  for (let i = 0; i < loan.numCuotas; i++) {
+// Genera un cronograma mensual por defecto (uno por cuota) a partir de la fecha de la primera cuota.
+function generarFechasCuotasDefault(fechaInicio, numCuotas) {
+  if (!fechaInicio || !numCuotas || numCuotas <= 0) return [];
+  const start = new Date(fechaInicio + "T00:00:00");
+  const fechas = [];
+  for (let i = 0; i < numCuotas; i++) {
     const d = new Date(start);
     d.setMonth(d.getMonth() + i);
+    fechas.push(d.toISOString().slice(0, 10));
+  }
+  return fechas;
+}
+
+// Devuelve el cronograma de vencimientos de un préstamo: usa las fechas
+// personalizadas (loan.fechasCuotas) si existen y coinciden con numCuotas;
+// si no, cae en el cálculo mensual automático desde la primera cuota.
+function fechasCuotasDe(loan) {
+  if (Array.isArray(loan.fechasCuotas) && loan.fechasCuotas.length === loan.numCuotas) {
+    return loan.fechasCuotas;
+  }
+  return generarFechasCuotasDefault(loan.fechaPrimeraCuota, loan.numCuotas);
+}
+
+// A partir del cronograma de cuotas, calcula cuál cuota (1..N) es la próxima por vencer.
+function proximaCuotaInfo(loan) {
+  if (!loan.numCuotas) return null;
+  const fechas = fechasCuotasDe(loan);
+  if (fechas.length === 0) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  for (let i = 0; i < fechas.length; i++) {
+    const d = new Date(fechas[i] + "T00:00:00");
     if (d >= today) {
-      idx = i;
-      break;
+      return { completado: false, numero: i + 1, fecha: fechas[i] };
     }
   }
-  if (idx >= loan.numCuotas) return { completado: true };
-  const d = new Date(start);
-  d.setMonth(d.getMonth() + idx);
-  return { completado: false, numero: idx + 1, fecha: d.toISOString().slice(0, 10) };
+  return { completado: true };
 }
 
 /* ------------------------------------------------------------------ */
@@ -786,6 +805,7 @@ function FinanceDashboard({ user }) {
         tasaInteres: form.tasaInteres || 0,
         numCuotas: form.numCuotas || 0,
         fechaPrimeraCuota: form.fechaPrimeraCuota || null,
+        fechasCuotas: form.fechasCuotas || null,
         estado: "Pendiente",
         txId,
       },
@@ -794,7 +814,23 @@ function FinanceDashboard({ user }) {
   };
 
   const editLoan = (loanId, form) => {
-    setLoans((prev) => prev.map((l) => (l.id === loanId ? { ...l, persona: form.persona, monto: form.monto, fecha: form.fecha, descripcion: form.descripcion, tasaInteres: form.tasaInteres || 0, numCuotas: form.numCuotas || 0, fechaPrimeraCuota: form.fechaPrimeraCuota || null } : l)));
+    setLoans((prev) =>
+      prev.map((l) =>
+        l.id === loanId
+          ? {
+              ...l,
+              persona: form.persona,
+              monto: form.monto,
+              fecha: form.fecha,
+              descripcion: form.descripcion,
+              tasaInteres: form.tasaInteres || 0,
+              numCuotas: form.numCuotas || 0,
+              fechaPrimeraCuota: form.fechaPrimeraCuota || null,
+              fechasCuotas: form.fechasCuotas || null,
+            }
+          : l
+      )
+    );
     // Si cambió el monto, actualiza también el movimiento original para que el saldo de la cuenta cuadre.
     const loan = loans.find((l) => l.id === loanId);
     if (loan && loan.monto !== form.monto) {
@@ -1786,6 +1822,11 @@ function LoanModal({ accounts, onClose, onSave, initial }) {
   const [tasaInteres, setTasaInteres] = useState(initial?.tasaInteres ? String(initial.tasaInteres) : "");
   const [numCuotas, setNumCuotas] = useState(initial?.numCuotas ? String(initial.numCuotas) : "");
   const [fechaPrimeraCuota, setFechaPrimeraCuota] = useState(initial?.fechaPrimeraCuota || initial?.fecha || todayISO());
+  const [fechasCuotas, setFechasCuotas] = useState(() =>
+    Array.isArray(initial?.fechasCuotas) && initial.fechasCuotas.length === initial?.numCuotas
+      ? initial.fechasCuotas
+      : generarFechasCuotasDefault(initial?.fechaPrimeraCuota || initial?.fecha || todayISO(), initial?.numCuotas || 0)
+  );
   const cuentasDisponibles = accounts.filter((a) => (a.monedas || ["PEN"]).includes(moneda));
   const [cuenta, setCuenta] = useState(initial?.cuenta || "");
 
@@ -1798,6 +1839,28 @@ function LoanModal({ accounts, onClose, onSave, initial }) {
   const tasaNum = Number(tasaInteres) || 0;
   const cuotasNum = Number(numCuotas) || 0;
   const cuotaMensual = conCuotas && cuotasNum > 0 ? calcularCuotaMensual(montoNum, tasaNum, cuotasNum) : 0;
+
+  // Mantiene el cronograma de vencimientos con el mismo largo que el número
+  // de cuotas: conserva las fechas ya personalizadas y completa las nuevas
+  // con un vencimiento mensual a partir de la última fecha conocida.
+  useEffect(() => {
+    if (!conCuotas) return;
+    setFechasCuotas((prev) => {
+      if (cuotasNum <= 0) return [];
+      if (prev.length === cuotasNum) return prev;
+      if (prev.length > cuotasNum) return prev.slice(0, cuotasNum);
+      const next = [...prev];
+      while (next.length < cuotasNum) {
+        const base = new Date((next[next.length - 1] || fechaPrimeraCuota || todayISO()) + "T00:00:00");
+        if (next.length > 0) base.setMonth(base.getMonth() + 1);
+        next.push(base.toISOString().slice(0, 10));
+      }
+      return next;
+    });
+  }, [cuotasNum, conCuotas]);
+
+  const updateFechaCuota = (idx, valor) => setFechasCuotas((prev) => prev.map((f, i) => (i === idx ? valor : f)));
+  const regenerarFechasCuotas = () => setFechasCuotas(generarFechasCuotasDefault(fechaPrimeraCuota, cuotasNum));
 
   const handleSubmit = () => {
     if (!persona || !montoNum || !(isEdit || cuenta)) return;
@@ -1812,6 +1875,7 @@ function LoanModal({ accounts, onClose, onSave, initial }) {
       tasaInteres: conCuotas ? tasaNum : 0,
       numCuotas: conCuotas ? cuotasNum : 0,
       fechaPrimeraCuota: conCuotas ? fechaPrimeraCuota : null,
+      fechasCuotas: conCuotas && cuotasNum > 0 ? fechasCuotas.slice(0, cuotasNum) : null,
     });
   };
 
@@ -1882,6 +1946,35 @@ function LoanModal({ accounts, onClose, onSave, initial }) {
           <Field label="Fecha de la primera cuota">
             <input type="date" value={fechaPrimeraCuota} onChange={(e) => setFechaPrimeraCuota(e.target.value)} className={inputCls} />
           </Field>
+
+          {cuotasNum > 0 && (
+            <Field label={`Cronograma de vencimientos (${cuotasNum} cuota${cuotasNum === 1 ? "" : "s"})`}>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <p className="text-xs leading-snug text-stone-400">Ajusta la fecha de cada cuota si no vencen todas el mismo día del mes.</p>
+                <button
+                  type="button"
+                  onClick={regenerarFechasCuotas}
+                  className="shrink-0 whitespace-nowrap rounded-md px-2 py-1 text-xs font-medium text-teal-600 hover:bg-teal-50 hover:text-teal-700"
+                >
+                  Generar automático
+                </button>
+              </div>
+              <div className="grid max-h-56 grid-cols-1 gap-2 overflow-y-auto rounded-xl border border-stone-200 bg-stone-50 p-2 sm:grid-cols-2">
+                {fechasCuotas.map((f, i) => (
+                  <div key={i} className="flex min-w-0 items-center gap-2 rounded-lg bg-white px-2 py-1.5 shadow-sm">
+                    <span className="flex h-5 w-6 shrink-0 items-center justify-center rounded bg-stone-100 text-[11px] font-semibold text-stone-500">{i + 1}</span>
+                    <input
+                      type="date"
+                      value={f}
+                      onChange={(e) => updateFechaCuota(i, e.target.value)}
+                      className="w-full min-w-0 rounded-md border border-stone-200 bg-white px-2 py-1 text-xs text-stone-700 outline-none focus:border-teal-500"
+                    />
+                  </div>
+                ))}
+              </div>
+            </Field>
+          )}
+
           {montoNum > 0 && cuotasNum > 0 && (
             <div className="mt-1 rounded-lg bg-teal-50 p-3 text-sm text-teal-800">
               <div className="flex justify-between">
