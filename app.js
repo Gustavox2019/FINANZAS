@@ -3,7 +3,7 @@
 /*  React (cargado como global vía CDN en index.html)                   */
 /* ------------------------------------------------------------------ */
 
-const { useState, useEffect, useMemo, useCallback, useRef } = React;
+const { useState, useEffect, useMemo, useCallback } = React;
 
 /* ------------------------------------------------------------------ */
 /*  Firebase (Auth + Firestore) — reemplaza el config de abajo con     */
@@ -69,7 +69,6 @@ const ICON_PATHS = {
   Landmark: "M3 21h18M4 10h16M12 3l9 5H3zM6 10v8M10 10v8M14 10v8M18 10v8",
   ChevronDown: "M6 9l6 6 6-6",
   Check: "M20 6L9 17l-5-5",
-  Search: "M11 19a8 8 0 100-16 8 8 0 000 16zM21 21l-4.35-4.35",
 };
 
 function Ico({ name, size = 16, className = "" }) {
@@ -149,52 +148,35 @@ const fmt = (n, moneda = "PEN") => {
 };
 const todayISO = () => new Date().toISOString().slice(0, 10);
 
-// Calcula la cuota mensual de un préstamo por el sistema francés (cuota fija),
-// a partir del monto, la tasa de interés y el número de cuotas.
-// tipoTasa: "anual" = TCEA (tasa de costo efectiva anual) → se convierte a mensual efectiva.
-//           "mensual" = TCEM (tasa de costo efectiva mensual) → se usa directamente.
-const tasaMensualEfectiva = (tasa, tipoTasa) => {
-  const t = (Number(tasa) || 0) / 100;
-  if (tipoTasa === "mensual") return t;
-  return Math.pow(1 + t, 1 / 12) - 1; // TCEA → TCEM equivalente
-};
+// Cuota mensual con interés compuesto (método francés), a partir de una tasa
+// efectiva anual (TEA). Si no hay tasa o cuotas, reparte el monto en partes iguales.
+function calcularCuotaMensual(monto, tasaAnualPct, numCuotas) {
+  if (!numCuotas || numCuotas <= 0) return 0;
+  const tea = (tasaAnualPct || 0) / 100;
+  if (tea <= 0) return monto / numCuotas;
+  const tasaMensual = Math.pow(1 + tea, 1 / 12) - 1;
+  return (monto * tasaMensual) / (1 - Math.pow(1 + tasaMensual, -numCuotas));
+}
 
-const calcCuota = (monto, tasa, numCuotas, tipoTasa = "anual") => {
-  const n = Number(numCuotas) || 0;
-  const capital = Number(monto) || 0;
-  if (n <= 0 || capital <= 0) return 0;
-  const i = tasaMensualEfectiva(tasa, tipoTasa);
-  if (i === 0) return capital / n;
-  const cuota = (capital * i) / (1 - Math.pow(1 + i, -n));
-  return Number.isFinite(cuota) ? cuota : 0;
-};
-
-// Arma un link de "agregar evento" de Google Calendar (evento de un día, sin
-// necesidad de iniciar sesión ni de una integración OAuth) para recordar la
-// fecha de pago de un préstamo o de una tarjeta de crédito.
-const googleCalendarLink = ({ fechaPago, tipo, persona, nombre, monto, moneda, numCuotas, cuotaMonto, tasaInteres, tipoTasa, porMoneda }) => {
-  if (!fechaPago) return "";
-  const start = fechaPago.replace(/-/g, "");
-  const endDate = new Date(fechaPago);
-  endDate.setDate(endDate.getDate() + 1);
-  const end = endDate.toISOString().slice(0, 10).replace(/-/g, "");
-  let text, details;
-  if (nombre) {
-    // Tarjeta de crédito
-    const deuda = (porMoneda?.PEN?.saldoActual || 0) > 0 ? fmt(porMoneda.PEN.saldoActual, "PEN") : fmt(porMoneda?.USD?.saldoActual || 0, "USD");
-    text = encodeURIComponent(`Pagar tarjeta ${nombre}`);
-    details = encodeURIComponent(`Recordatorio de pago de tarjeta de crédito registrado en Control de Dinero.\nSaldo: ${deuda}`);
-  } else {
-    // Préstamo
-    const accion = tipo === "Presté" ? "Cobrar" : "Pagar";
-    const cuotaTxto = numCuotas ? ` (cuota ${fmt(cuotaMonto || calcCuota(monto, tasaInteres, numCuotas, tipoTasa), moneda)})` : "";
-    text = encodeURIComponent(`${accion} préstamo — ${persona}${cuotaTxto}`);
-    details = encodeURIComponent(
-      `Préstamo registrado en Control de Dinero.\nMonto: ${fmt(monto, moneda)}${numCuotas ? `\nCuotas: ${numCuotas}` : ""}${tasaInteres ? `\nTasa: ${tasaInteres}% (${tipoTasa === "mensual" ? "TCEM" : "TCEA"})` : ""}`
-    );
+// A partir de la fecha de la primera cuota, calcula cuál cuota (1..N) es la próxima por vencer.
+function proximaCuotaInfo(loan) {
+  if (!loan.numCuotas || !loan.fechaPrimeraCuota) return null;
+  const start = new Date(loan.fechaPrimeraCuota + "T00:00:00");
+  const today = new Date();
+  let idx = loan.numCuotas;
+  for (let i = 0; i < loan.numCuotas; i++) {
+    const d = new Date(start);
+    d.setMonth(d.getMonth() + i);
+    if (d >= today) {
+      idx = i;
+      break;
+    }
   }
-  return `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${text}&dates=${start}/${end}&details=${details}`;
-};
+  if (idx >= loan.numCuotas) return { completado: true };
+  const d = new Date(start);
+  d.setMonth(d.getMonth() + idx);
+  return { completado: false, numero: idx + 1, fecha: d.toISOString().slice(0, 10) };
+}
 
 /* ------------------------------------------------------------------ */
 /*  Gráficos en SVG puro (sin dependencias externas)                    */
@@ -330,21 +312,8 @@ function TrendLineChart({ data, dataKey, height = 200, color = "#0d9488" }) {
 /* ------------------------------------------------------------------ */
 
 function Modal({ title, onClose, children }) {
-  // Evita que el modal se cierre al seleccionar texto con el mouse: solo cierra
-  // si el mousedown Y el click ocurrieron directamente sobre el fondo (backdrop),
-  // no cuando el arrastre de una selección de texto termina fuera de la tarjeta.
-  const mouseDownOnBackdrop = useRef(false);
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/50 p-4"
-      onMouseDown={(e) => {
-        mouseDownOnBackdrop.current = e.target === e.currentTarget;
-      }}
-      onClick={(e) => {
-        if (mouseDownOnBackdrop.current && e.target === e.currentTarget) onClose();
-        mouseDownOnBackdrop.current = false;
-      }}
-    >
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/50 p-4" onClick={onClose}>
       <div
         className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-white shadow-2xl"
         onClick={(e) => e.stopPropagation()}
@@ -581,6 +550,7 @@ function FinanceDashboard({ user }) {
   const [showAccModal, setShowAccModal] = useState(false);
   const [showLoanModal, setShowLoanModal] = useState(false);
   const [settlingLoan, setSettlingLoan] = useState(null);
+  const [payingCard, setPayingCard] = useState(null); // { card, moneda }
   const [editingLoan, setEditingLoan] = useState(null);
   const [saveState, setSaveState] = useState("idle");
 
@@ -617,10 +587,11 @@ function FinanceDashboard({ user }) {
     const balances = {};
     accounts.forEach((a) => (balances[a.nombre] = { PEN: 0, USD: 0 }));
     transactions.forEach((t) => {
+      if (t.esTarjeta) return; // los gastos pagados con tarjeta no tocan el saldo de ninguna cuenta
       const m = t.moneda || "PEN";
       if (!balances[t.cuenta]) balances[t.cuenta] = { PEN: 0, USD: 0 };
       if (t.tipo === "Ingreso") balances[t.cuenta][m] += t.monto;
-      else if (t.tipo === "Gasto") balances[t.cuenta][m] -= t.monto;
+      else if (t.tipo === "Gasto" || t.tipo === "PagoTarjeta") balances[t.cuenta][m] -= t.monto;
       else if (t.tipo === "Transferencia") {
         balances[t.cuenta][m] -= t.monto;
         if (!balances[t.cuentaDestino]) balances[t.cuentaDestino] = { PEN: 0, USD: 0 };
@@ -629,6 +600,22 @@ function FinanceDashboard({ user }) {
     });
     return balances;
   }, [accounts, transactions]);
+
+  // Deuda de cada tarjeta = saldo inicial que le pusiste al crearla + gastos pagados con
+  // ella - pagos que le hiciste, todo calculado por separado en soles y dólares.
+  const cardDebt = useMemo(() => {
+    const debt = {};
+    cards.forEach((c) => {
+      debt[c.id] = { PEN: c.porMoneda?.PEN?.saldoActual || 0, USD: c.porMoneda?.USD?.saldoActual || 0 };
+    });
+    transactions.forEach((t) => {
+      if (!t.tarjetaId || !debt[t.tarjetaId]) return;
+      const m = t.moneda || "PEN";
+      if (t.tipo === "Gasto" && t.esTarjeta) debt[t.tarjetaId][m] += t.monto;
+      else if (t.tipo === "PagoTarjeta") debt[t.tarjetaId][m] -= t.monto;
+    });
+    return debt;
+  }, [cards, transactions]);
 
   const availableMonths = useMemo(() => {
     const set = new Set(transactions.map((t) => monthKey(t.fecha)));
@@ -659,10 +646,7 @@ function FinanceDashboard({ user }) {
   const totalUSD = accounts.reduce((s, a) => s + (accountBalances[a.nombre]?.USD || 0), 0);
   const patrimonioSoles = totalPEN + totalUSD * settings.tipoCambio;
 
-  const deudaTarjetasSoles = cards.reduce(
-    (s, c) => s + (c.porMoneda?.PEN?.saldoActual || 0) + (c.porMoneda?.USD?.saldoActual || 0) * settings.tipoCambio,
-    0
-  );
+  const deudaTarjetasSoles = cards.reduce((s, c) => s + (cardDebt[c.id]?.PEN || 0) + (cardDebt[c.id]?.USD || 0) * settings.tipoCambio, 0);
 
   const gastosPorCategoria = useMemo(() => {
     const map = {};
@@ -704,17 +688,20 @@ function FinanceDashboard({ user }) {
   const cardsWithUtil = useMemo(
     () =>
       cards.map((c) => {
-        let diasPago = null;
-        if (c.fechaPago) diasPago = Math.ceil((new Date(c.fechaPago + "T00:00:00") - new Date(new Date().toDateString())) / 86400000);
+        const saldoPEN = cardDebt[c.id]?.PEN || 0;
+        const saldoUSD = cardDebt[c.id]?.USD || 0;
         return {
           ...c,
-          utilPEN: c.porMoneda?.PEN?.limite > 0 ? (c.porMoneda.PEN.saldoActual / c.porMoneda.PEN.limite) * 100 : 0,
-          utilUSD: c.porMoneda?.USD?.limite > 0 ? (c.porMoneda.USD.saldoActual / c.porMoneda.USD.limite) * 100 : 0,
-          diasPago,
-          vencido: diasPago !== null && diasPago < 0,
+          porMoneda: {
+            ...(c.porMoneda || {}),
+            ...(c.porMoneda?.PEN ? { PEN: { ...c.porMoneda.PEN, saldoActual: saldoPEN } } : {}),
+            ...(c.porMoneda?.USD ? { USD: { ...c.porMoneda.USD, saldoActual: saldoUSD } } : {}),
+          },
+          utilPEN: c.porMoneda?.PEN?.limite > 0 ? (saldoPEN / c.porMoneda.PEN.limite) * 100 : 0,
+          utilUSD: c.porMoneda?.USD?.limite > 0 ? (saldoUSD / c.porMoneda.USD.limite) * 100 : 0,
         };
       }),
-    [cards]
+    [cards, cardDebt]
   );
 
   const loansPendientes = loans.filter((l) => l.estado === "Pendiente");
@@ -724,12 +711,6 @@ function FinanceDashboard({ user }) {
     if (l.tipo === "Presté") teDeben[l.moneda] += l.monto;
     else debes[l.moneda] += l.monto;
   });
-
-  // Patrimonio neto real = efectivo en cuentas + lo que te deben - lo que debes - deuda en tarjetas.
-  // Ignorar las deudas al calcular "patrimonio" da una foto falsa de la situación financiera.
-  const teDebenSoles = teDeben.PEN + teDeben.USD * settings.tipoCambio;
-  const debesSoles = debes.PEN + debes.USD * settings.tipoCambio;
-  const patrimonioNeto = patrimonioSoles + teDebenSoles - debesSoles - deudaTarjetasSoles;
 
   const alerts = useMemo(() => {
     const list = [];
@@ -746,21 +727,13 @@ function FinanceDashboard({ user }) {
     cardsWithUtil.forEach((c) => {
       if (c.utilPEN >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.utilPEN.toFixed(0)}% de uso en soles` });
       if (c.utilUSD >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.utilUSD.toFixed(0)}% de uso en dólares` });
-      if (c.diasPago !== null) {
-        if (c.vencido) list.push({ type: "danger", text: `Pago de ${c.nombre} vencido hace ${Math.abs(c.diasPago)} día(s)` });
-        else if (c.diasPago <= 7) list.push({ type: "warn", text: `Pago de ${c.nombre} vence en ${c.diasPago} día(s)` });
+      if (c.fechaPago) {
+        const days = Math.ceil((new Date(c.fechaPago) - new Date()) / 86400000);
+        if (days >= 0 && days <= 7) list.push({ type: "warn", text: `Pago de ${c.nombre} vence en ${days} día(s)` });
       }
     });
-    loansPendientes.forEach((l) => {
-      if (!l.fechaPago) return;
-      const days = Math.ceil((new Date(l.fechaPago + "T00:00:00") - new Date(new Date().toDateString())) / 86400000);
-      const accion = l.tipo === "Presté" ? "Cobrar a" : "Pagarle a";
-      if (days < 0) list.push({ type: "danger", text: `${accion} ${l.persona} — pago vencido hace ${Math.abs(days)} día(s)` });
-      else if (days <= 7) list.push({ type: "warn", text: `${accion} ${l.persona} — pago vence en ${days} día(s)` });
-    });
-    const loansPendientesSinFecha = loansPendientes.filter((l) => !l.fechaPago).length;
-    if (loansPendientesSinFecha > 0) {
-      list.push({ type: "warn", text: `Tienes ${loansPendientesSinFecha} préstamo(s) pendiente(s) sin fecha de pago registrada` });
+    if (loansPendientes.length > 0) {
+      list.push({ type: "warn", text: `Tienes ${loansPendientes.length} préstamo(s) pendiente(s) de cobrar o pagar` });
     }
     return list;
   }, [accounts, accountBalances, budgetsWithSpent, cardsWithUtil, loansPendientes]);
@@ -768,6 +741,10 @@ function FinanceDashboard({ user }) {
   /* ---------------------------- Acciones --------------------------- */
 
   const addTransaction = (tx) => setTransactions((prev) => [{ id: uid(), ...tx }, ...prev]);
+  const payCard = (card, moneda, cuenta, monto, fecha) => {
+    addTransaction({ tipo: "PagoTarjeta", cuenta, tarjetaId: card.id, moneda, monto, fecha, grupo: "Pago de tarjeta", categoria: "Pago de tarjeta", descripcion: `Pago tarjeta ${card.nombre}`, recurrente: "NO" });
+    setPayingCard(null);
+  };
   const deleteTransaction = (id) => setTransactions((prev) => prev.filter((t) => t.id !== id));
   const updateBudget = (id, presupuesto) => setBudgets((prev) => prev.map((b) => (b.id === id ? { ...b, presupuesto } : b)));
   const addCard = (card) => setCards((prev) => [...prev, { id: uid(), ...card }]);
@@ -806,19 +783,24 @@ function FinanceDashboard({ user }) {
         cuenta: form.cuenta,
         fecha: form.fecha,
         descripcion: form.descripcion,
+        tasaInteres: form.tasaInteres || 0,
+        numCuotas: form.numCuotas || 0,
+        fechaPrimeraCuota: form.fechaPrimeraCuota || null,
         estado: "Pendiente",
         txId,
-        tasaInteres: form.tasaInteres || 0,
-        tipoTasa: form.tipoTasa || "anual",
-        numCuotas: form.numCuotas || 0,
-        cuotaMonto: form.cuotaMonto || 0,
-        fechaPago: form.fechaPago || "",
       },
       ...prev,
     ]);
   };
 
-  const updateLoan = (id, updates) => setLoans((prev) => prev.map((l) => (l.id === id ? { ...l, ...updates } : l)));
+  const editLoan = (loanId, form) => {
+    setLoans((prev) => prev.map((l) => (l.id === loanId ? { ...l, persona: form.persona, monto: form.monto, fecha: form.fecha, descripcion: form.descripcion, tasaInteres: form.tasaInteres || 0, numCuotas: form.numCuotas || 0, fechaPrimeraCuota: form.fechaPrimeraCuota || null } : l)));
+    // Si cambió el monto, actualiza también el movimiento original para que el saldo de la cuenta cuadre.
+    const loan = loans.find((l) => l.id === loanId);
+    if (loan && loan.monto !== form.monto) {
+      setTransactions((prev) => prev.map((t) => (t.id === loan.txId ? { ...t, monto: form.monto, fecha: form.fecha, descripcion: form.descripcion || t.descripcion, persona: form.persona } : t)));
+    }
+  };
 
   const settleLoan = (loan, cuenta, fecha) => {
     const txId = uid();
@@ -958,7 +940,6 @@ function FinanceDashboard({ user }) {
               ahorroMes={ahorroMes}
               pctAhorro={pctAhorro}
               patrimonioSoles={patrimonioSoles}
-              patrimonioNeto={patrimonioNeto}
               totalPEN={totalPEN}
               totalUSD={totalUSD}
               deudaTarjetasSoles={deudaTarjetasSoles}
@@ -982,8 +963,8 @@ function FinanceDashboard({ user }) {
               debes={debes}
               onAdd={() => setShowLoanModal(true)}
               onSettle={(loan) => setSettlingLoan(loan)}
-              onDelete={deleteLoan}
               onEdit={(loan) => setEditingLoan(loan)}
+              onDelete={deleteLoan}
             />
           )}
           {tab === "cuentas" && (
@@ -995,6 +976,7 @@ function FinanceDashboard({ user }) {
               onDeleteAccount={deleteAccount}
               onAddCard={() => setShowCardModal(true)}
               onDeleteCard={deleteCard}
+              onPayCard={(card, moneda) => setPayingCard({ card, moneda })}
               settings={settings}
               setSettings={setSettings}
             />
@@ -1005,6 +987,7 @@ function FinanceDashboard({ user }) {
       {showTxModal && (
         <TransactionModal
           accounts={accounts}
+          cards={cards}
           onClose={() => setShowTxModal(false)}
           onSave={(tx) => {
             addTransaction(tx);
@@ -1049,13 +1032,24 @@ function FinanceDashboard({ user }) {
         />
       )}
       {editingLoan && (
-        <EditLoanModal
-          loan={editingLoan}
+        <LoanModal
+          accounts={accounts}
+          initial={editingLoan}
           onClose={() => setEditingLoan(null)}
-          onSave={(updates) => {
-            updateLoan(editingLoan.id, updates);
+          onSave={(form) => {
+            editLoan(editingLoan.id, form);
             setEditingLoan(null);
           }}
+        />
+      )}
+      {payingCard && (
+        <PayCardModal
+          card={payingCard.card}
+          moneda={payingCard.moneda}
+          deudaActual={cardDebt[payingCard.card.id]?.[payingCard.moneda] || 0}
+          accounts={accounts.filter((a) => (a.monedas || []).includes(payingCard.moneda))}
+          onClose={() => setPayingCard(null)}
+          onConfirm={(cuenta, monto, fecha) => payCard(payingCard.card, payingCard.moneda, cuenta, monto, fecha)}
         />
       )}
     </div>
@@ -1067,19 +1061,13 @@ function FinanceDashboard({ user }) {
 /* ------------------------------------------------------------------ */
 
 function ResumenTab({
-  ingresosMes, gastosMes, ahorroMes, pctAhorro, patrimonioSoles, patrimonioNeto, totalPEN, totalUSD,
+  ingresosMes, gastosMes, ahorroMes, pctAhorro, patrimonioSoles, totalPEN, totalUSD,
   deudaTarjetasSoles, prestado, cobrado, gastosPorCategoria, evolucion6m, topGastos, alerts, settings,
 }) {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-        <StatCard
-          icon="Landmark"
-          label="Patrimonio neto (S/ equiv.)"
-          value={fmt(patrimonioNeto)}
-          sub={`Efectivo: ${fmt(patrimonioSoles)}`}
-          tone={patrimonioNeto >= 0 ? "good" : "bad"}
-        />
+        <StatCard icon="Landmark" label="Patrimonio (S/ equiv.)" value={fmt(patrimonioSoles)} sub={`${fmt(totalPEN)} + ${fmt(totalUSD, "USD")}`} />
         <StatCard icon="TrendingUp" label="Ingresos del mes" value={fmt(ingresosMes)} tone="good" />
         <StatCard icon="TrendingDown" label="Gastos del mes" value={fmt(gastosMes)} tone="bad" />
         <StatCard icon="PiggyBank" label="Ahorro del mes" value={fmt(ahorroMes)} sub={`${pctAhorro.toFixed(1)}% de tus ingresos`} tone={ahorroMes >= 0 ? "good" : "bad"} />
@@ -1192,29 +1180,16 @@ function ResumenTab({
 
 function TransaccionesTab({ transactions, onDelete }) {
   const [filterTipo, setFilterTipo] = useState("Todos");
-  const [busqueda, setBusqueda] = useState("");
-  const filtered = transactions
-    .filter((t) => filterTipo === "Todos" || t.tipo === filterTipo)
-    .filter((t) => {
-      if (!busqueda.trim()) return true;
-      const q = busqueda.trim().toLowerCase();
-      return [t.descripcion, t.categoria, t.cuenta, t.cuentaDestino, t.persona].filter(Boolean).some((v) => v.toLowerCase().includes(q));
-    });
+  const filtered = filterTipo === "Todos" ? transactions : transactions.filter((t) => t.tipo === filterTipo);
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <ChipGroup options={["Todos", "Ingreso", "Gasto", "Transferencia"]} value={filterTipo} onChange={setFilterTipo} />
-        <div className="relative w-full sm:w-64">
-          <Ico name="Search" size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-stone-400" />
-          <input
-            value={busqueda}
-            onChange={(e) => setBusqueda(e.target.value)}
-            placeholder="Buscar por descripción, categoría, cuenta…"
-            className="w-full rounded-lg border border-stone-300 bg-white py-2 pl-9 pr-3 text-sm outline-none focus:border-teal-600 focus:ring-1 focus:ring-teal-600"
-          />
-        </div>
-      </div>
+      <ChipGroup
+        options={["Todos", "Ingreso", "Gasto", "Transferencia", "PagoTarjeta"]}
+        value={filterTipo}
+        onChange={setFilterTipo}
+        getLabel={(v) => (v === "PagoTarjeta" ? "Pago de tarjeta" : v)}
+      />
       <div className="overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-sm">
         <table className="w-full text-sm">
           <thead>
@@ -1235,19 +1210,32 @@ function TransaccionesTab({ transactions, onDelete }) {
                 <td className="px-4 py-2.5">
                   <span
                     className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                      t.tipo === "Ingreso" ? "bg-emerald-50 text-emerald-700" : t.tipo === "Gasto" ? "bg-rose-50 text-rose-700" : "bg-blue-50 text-blue-700"
+                      t.tipo === "Ingreso"
+                        ? "bg-emerald-50 text-emerald-700"
+                        : t.tipo === "Gasto"
+                        ? "bg-rose-50 text-rose-700"
+                        : t.tipo === "PagoTarjeta"
+                        ? "bg-violet-50 text-violet-700"
+                        : "bg-blue-50 text-blue-700"
                     }`}
                   >
-                    {t.tipo}
+                    {t.tipo === "PagoTarjeta" ? "Pago de tarjeta" : t.tipo}
                   </span>
                 </td>
                 <td className="px-4 py-2.5 text-stone-700">{t.categoria}</td>
                 <td className="px-4 py-2.5 text-stone-700">
-                  {t.cuenta}
+                  <span className="inline-flex items-center gap-1">
+                    {t.esTarjeta && <Ico name="CreditCard" size={13} className="text-stone-400" />}
+                    {t.cuenta}
+                  </span>
                   {t.cuentaDestino ? ` → ${t.cuentaDestino}` : ""}
                 </td>
                 <td className="max-w-[220px] truncate px-4 py-2.5 text-stone-500">{t.descripcion}</td>
-                <td className={`whitespace-nowrap px-4 py-2.5 text-right font-mono font-medium ${t.tipo === "Ingreso" ? "text-emerald-700" : t.tipo === "Gasto" ? "text-rose-700" : "text-blue-700"}`}>
+                <td
+                  className={`whitespace-nowrap px-4 py-2.5 text-right font-mono font-medium ${
+                    t.tipo === "Ingreso" ? "text-emerald-700" : t.tipo === "Gasto" ? "text-rose-700" : t.tipo === "PagoTarjeta" ? "text-violet-700" : "text-blue-700"
+                  }`}
+                >
                   <span className="mr-1 align-middle">
                     <CurrencyBadge moneda={t.moneda || "PEN"} />
                   </span>
@@ -1333,21 +1321,7 @@ function MultiCurrencySum({ obj }) {
   return <span>{parts.map((m) => fmt(obj[m], m)).join(" · ")}</span>;
 }
 
-// Deriva los datos financieros de un préstamo: cuota, costo total del crédito
-// (intereses), y estado del próximo pago (días restantes / vencido).
-function loanMeta(l) {
-  const cuota = l.cuotaMonto || calcCuota(l.monto, l.tasaInteres, l.numCuotas, l.tipoTasa);
-  const totalAPagar = l.numCuotas > 0 ? cuota * l.numCuotas : l.monto;
-  const interesTotal = Math.max(0, totalAPagar - l.monto);
-  let diasPago = null;
-  if (l.fechaPago) {
-    diasPago = Math.ceil((new Date(l.fechaPago + "T00:00:00") - new Date(new Date().toDateString())) / 86400000);
-  }
-  const vencido = l.estado === "Pendiente" && diasPago !== null && diasPago < 0;
-  return { cuota, totalAPagar, interesTotal, diasPago, vencido };
-}
-
-function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete, onEdit }) {
+function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onEdit, onDelete }) {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -1380,82 +1354,74 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete, onEdit
           Aún no registras préstamos. Agrega uno cuando prestes o te presten dinero.
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {loans.map((l) => {
-            const { cuota, totalAPagar, interesTotal, diasPago, vencido } = loanMeta(l);
-            const estadoLabel = vencido ? "Vencido" : l.estado;
-            const estadoTone = vencido
-              ? "bg-rose-50 text-rose-700"
-              : l.estado === "Pendiente"
-              ? "bg-amber-50 text-amber-700"
-              : "bg-emerald-50 text-emerald-700";
+            const conCuotas = l.numCuotas > 0;
+            const cuotaMensual = conCuotas ? calcularCuotaMensual(l.monto, l.tasaInteres, l.numCuotas) : 0;
+            const totalConInteres = cuotaMensual * l.numCuotas;
             return (
-              <div key={l.id} className={`relative flex flex-col rounded-2xl border bg-white p-4 shadow-sm ${vencido ? "border-rose-300" : "border-stone-200"}`}>
-                <div className="mb-2 flex items-start justify-between gap-2">
-                  <div>
-                    <div className="font-serif text-base text-stone-900">{l.persona}</div>
-                    <span className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${l.tipo === "Presté" ? "bg-sky-50 text-sky-700" : "bg-purple-50 text-purple-700"}`}>
-                      {l.tipo === "Presté" ? "Yo presté" : "Me prestaron"}
-                    </span>
-                  </div>
-                  <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${estadoTone}`}>{estadoLabel}</span>
-                </div>
-
-                <div className="mb-3 font-mono text-2xl font-semibold text-stone-900">{fmt(l.monto, l.moneda)}</div>
-
-                {l.numCuotas > 0 && (
-                  <div className="mb-3 space-y-1 rounded-xl bg-stone-50 p-3 text-xs">
-                    <div className="flex justify-between text-stone-500">
-                      <span>Cuota mensual</span>
-                      <span className="font-mono font-medium text-stone-800">{fmt(cuota, l.moneda)} × {l.numCuotas}</span>
-                    </div>
-                    <div className="flex justify-between text-stone-500">
-                      <span>Tasa</span>
-                      <span className="font-medium text-stone-800">{l.tasaInteres}% {l.tipoTasa === "mensual" ? "TCEM" : "TCEA"}</span>
-                    </div>
-                    <div className="flex justify-between text-stone-500">
-                      <span>Costo del crédito (interés)</span>
-                      <span className="font-mono font-medium text-amber-700">{fmt(interesTotal, l.moneda)}</span>
-                    </div>
-                    <div className="flex justify-between border-t border-stone-200 pt-1 text-stone-600">
-                      <span className="font-medium">Total a pagar</span>
-                      <span className="font-mono font-semibold text-stone-900">{fmt(totalAPagar, l.moneda)}</span>
-                    </div>
-                  </div>
-                )}
-
-                <div className="mb-3 flex items-center justify-between text-xs text-stone-500">
-                  <span>Registrado el {l.fecha}</span>
-                  {l.fechaPago && (
-                    <a
-                      href={googleCalendarLink(l)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className={`inline-flex items-center gap-1 font-medium hover:underline ${vencido ? "text-rose-600" : "text-teal-700"}`}
-                      title="Agregar a Google Calendar"
-                    >
-                      <Ico name="Landmark" size={12} />
-                      {l.fechaPago}
-                      {diasPago !== null && l.estado === "Pendiente" && (
-                        <span>{vencido ? ` (venció hace ${Math.abs(diasPago)}d)` : diasPago === 0 ? " (hoy)" : ` (en ${diasPago}d)`}</span>
-                      )}
-                    </a>
-                  )}
-                </div>
-
-                <div className="mt-auto flex items-center justify-end gap-2 border-t border-stone-100 pt-3">
-                  <button onClick={() => onEdit(l)} className="rounded p-1.5 text-stone-300 hover:bg-teal-50 hover:text-teal-600" title="Editar interés, cuotas y fecha de pago">
+              <div key={l.id} className="relative overflow-hidden rounded-2xl border border-stone-200 bg-gradient-to-br from-stone-900 to-stone-700 p-5 text-white shadow-sm">
+                <div className="absolute right-3 top-3 flex gap-1">
+                  <button onClick={() => onEdit(l)} className="rounded p-1 text-stone-300 hover:bg-white/10 hover:text-white">
                     <Ico name="Pencil" size={14} />
                   </button>
-                  {l.estado === "Pendiente" && (
-                    <button onClick={() => onSettle(l)} className="rounded-lg border border-teal-600 px-2.5 py-1 text-xs font-medium text-teal-700 hover:bg-teal-50">
-                      Marcar liquidado
-                    </button>
-                  )}
-                  <button onClick={() => onDelete(l)} className="rounded p-1.5 text-stone-300 hover:bg-rose-50 hover:text-rose-600">
+                  <button onClick={() => onDelete(l)} className="rounded p-1 text-stone-300 hover:bg-white/10 hover:text-white">
                     <Ico name="Trash2" size={14} />
                   </button>
                 </div>
+
+                <div className="text-xs uppercase tracking-wide text-stone-300">{l.tipo === "Presté" ? "Le prestaste a" : "Te prestó"}</div>
+                <div className="mb-4 font-serif text-lg">{l.persona}</div>
+
+                <div className="mb-1 flex items-end justify-between">
+                  <span className="text-xs text-stone-300">Monto</span>
+                  <span className="font-mono text-xl font-semibold">{fmt(l.monto, l.moneda)}</span>
+                </div>
+
+                {conCuotas ? (
+                  <div className="mt-3 space-y-1 border-t border-white/10 pt-3 text-xs">
+                    <div className="flex justify-between">
+                      <span className="text-stone-400">Tasa de interés (TEA)</span>
+                      <span>{l.tasaInteres}%</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-stone-400">Cuotas</span>
+                      <span>{l.numCuotas}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-stone-400">Cuota mensual</span>
+                      <span className="font-mono">{fmt(cuotaMensual, l.moneda)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-stone-400">Total con interés</span>
+                      <span className="font-mono">{fmt(totalConInteres, l.moneda)}</span>
+                    </div>
+                    {(() => {
+                      const info = proximaCuotaInfo(l);
+                      if (!info) return null;
+                      return (
+                        <div className="flex justify-between">
+                          <span className="text-stone-400">{info.completado ? "Cuotas" : "Próxima cuota"}</span>
+                          <span>{info.completado ? "Completadas ✓" : `${info.numero}/${l.numCuotas} · ${info.fecha}`}</span>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                ) : (
+                  <div className="mt-3 border-t border-white/10 pt-3 text-xs text-stone-400">Sin interés ni cuotas (pago único)</div>
+                )}
+
+                <div className="mt-3 flex items-center justify-between border-t border-white/10 pt-3 text-xs">
+                  <span className={`rounded-full px-2 py-0.5 font-medium ${l.estado === "Pendiente" ? "bg-amber-400/20 text-amber-300" : "bg-emerald-400/20 text-emerald-300"}`}>{l.estado}</span>
+                  <span className="text-stone-400">{l.fecha}</span>
+                </div>
+                {l.descripcion && <div className="mt-2 truncate text-xs text-stone-400">{l.descripcion}</div>}
+
+                {l.estado === "Pendiente" && (
+                  <button onClick={() => onSettle(l)} className="mt-3 w-full rounded-lg bg-teal-600 py-1.5 text-xs font-medium text-white hover:bg-teal-700">
+                    Marcar como liquidado
+                  </button>
+                )}
               </div>
             );
           })}
@@ -1469,7 +1435,7 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onDelete, onEdit
 /*  Tab: Cuentas y tarjetas de crédito (unificado)                      */
 /* ------------------------------------------------------------------ */
 
-function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, onDeleteAccount, onAddCard, onDeleteCard, settings, setSettings }) {
+function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, onDeleteAccount, onAddCard, onDeleteCard, onPayCard, settings, setSettings }) {
   return (
     <div className="space-y-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1533,7 +1499,7 @@ function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, on
         ) : (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {cardsWithUtil.map((c) => (
-              <div key={c.id} className={`relative overflow-hidden rounded-2xl border p-5 text-white shadow-sm ${c.vencido ? "border-rose-400 bg-gradient-to-br from-rose-900 to-stone-800" : "border-stone-200 bg-gradient-to-br from-stone-900 to-stone-700"}`}>
+              <div key={c.id} className="relative overflow-hidden rounded-2xl border border-stone-200 bg-gradient-to-br from-stone-900 to-stone-700 p-5 text-white shadow-sm">
                 <button onClick={() => onDeleteCard(c.id)} className="absolute right-3 top-3 rounded p-1 text-stone-300 hover:bg-white/10 hover:text-white">
                   <Ico name="Trash2" size={14} />
                 </button>
@@ -1553,7 +1519,14 @@ function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, on
                       <div className="mb-1 h-1.5 w-full overflow-hidden rounded-full bg-white/20">
                         <div className={`h-full rounded-full ${util >= 80 ? "bg-rose-400" : util >= 50 ? "bg-amber-400" : "bg-teal-400"}`} style={{ width: `${Math.min(100, util)}%` }} />
                       </div>
-                      <div className="text-xs text-stone-300">{util.toFixed(0)}% utilizado{d.pagoMinimo ? ` · mín. ${fmt(d.pagoMinimo, m)}` : ""}</div>
+                      <div className="mb-2 text-xs text-stone-300">
+                        {util.toFixed(0)}% utilizado{d.pagoMinimo ? ` · mín. ${fmt(d.pagoMinimo, m)}` : ""}
+                      </div>
+                      {d.saldoActual > 0 && (
+                        <button onClick={() => onPayCard(c, m)} className="w-full rounded-lg bg-white/10 py-1.5 text-xs font-medium text-white hover:bg-white/20">
+                          Pagar esta tarjeta
+                        </button>
+                      )}
                     </div>
                   );
                 })}
@@ -1565,22 +1538,7 @@ function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, on
                   </div>
                   <div>
                     <div className="text-stone-400">Fecha de pago</div>
-                    {c.fechaPago ? (
-                      <a
-                        href={googleCalendarLink(c)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className={`inline-flex items-center gap-1 font-medium hover:underline ${c.vencido ? "text-rose-300" : "text-teal-300"}`}
-                        title="Agregar a Google Calendar"
-                      >
-                        {c.fechaPago}
-                        {c.diasPago !== null && (
-                          <span>{c.vencido ? ` (venció hace ${Math.abs(c.diasPago)}d)` : c.diasPago === 0 ? " (hoy)" : ` (en ${c.diasPago}d)`}</span>
-                        )}
-                      </a>
-                    ) : (
-                      "—"
-                    )}
+                    <div>{c.fechaPago || "—"}</div>
                   </div>
                   <div className="col-span-2">
                     <div className="text-stone-400">TCEA</div>
@@ -1600,12 +1558,14 @@ function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, on
 /*  Modal: Nuevo movimiento (rediseñado, con chips en vez de dropdowns) */
 /* ------------------------------------------------------------------ */
 
-function TransactionModal({ accounts, onClose, onSave }) {
+function TransactionModal({ accounts, cards, onClose, onSave }) {
   const [tipo, setTipo] = useState("Gasto");
   const [moneda, setMoneda] = useState("PEN");
   const [fecha, setFecha] = useState(todayISO());
   const [showDatePicker, setShowDatePicker] = useState(false);
+  const [metodoPago, setMetodoPago] = useState("cuenta"); // "cuenta" | "tarjeta" (solo aplica a Gasto)
   const [cuenta, setCuenta] = useState("");
+  const [tarjetaId, setTarjetaId] = useState("");
   const [cuentaDestino, setCuentaDestino] = useState("");
   const [grupo, setGrupo] = useState("Básicos");
   const [categoria, setCategoria] = useState(BASICOS_CATS[0]);
@@ -1614,10 +1574,16 @@ function TransactionModal({ accounts, onClose, onSave }) {
   const [recurrente, setRecurrente] = useState("NO");
 
   const cuentasDisponibles = accounts.filter((a) => (a.monedas || ["PEN"]).includes(moneda));
+  const tarjetasDisponibles = (cards || []).filter((c) => (c.monedas || []).includes(moneda));
 
   useEffect(() => {
     if (!cuentasDisponibles.find((a) => a.nombre === cuenta)) setCuenta(cuentasDisponibles[0]?.nombre || "");
+    if (!tarjetasDisponibles.find((c) => c.id === tarjetaId)) setTarjetaId(tarjetasDisponibles[0]?.id || "");
   }, [moneda]);
+
+  useEffect(() => {
+    if (tipo !== "Gasto") setMetodoPago("cuenta");
+  }, [tipo]);
 
   const grupoOptionsByTipo = {
     Ingreso: ["Balance", "Otros ingresos", "Recarga Tarjeta", "Sueldo", "Freelance"],
@@ -1625,9 +1591,29 @@ function TransactionModal({ accounts, onClose, onSave }) {
     Transferencia: ["Transferencia"],
   };
   const catOptions = grupo === "Básicos" ? BASICOS_CATS : DESEO_CATS;
+  const pagaConTarjeta = tipo === "Gasto" && metodoPago === "tarjeta";
+  const tarjetaSeleccionada = tarjetasDisponibles.find((c) => c.id === tarjetaId);
 
   const handleSubmit = () => {
-    if (!monto || Number(monto) <= 0 || !cuenta) return;
+    if (!monto || Number(monto) <= 0) return;
+    if (pagaConTarjeta) {
+      if (!tarjetaSeleccionada) return;
+      onSave({
+        tipo: "Gasto",
+        fecha,
+        cuenta: tarjetaSeleccionada.nombre,
+        esTarjeta: true,
+        tarjetaId: tarjetaSeleccionada.id,
+        grupo,
+        categoria,
+        monto: Number(monto),
+        moneda,
+        descripcion,
+        recurrente,
+      });
+      return;
+    }
+    if (!cuenta) return;
     onSave({
       tipo,
       fecha,
@@ -1709,14 +1695,33 @@ function TransactionModal({ accounts, onClose, onSave }) {
         </div>
       </Field>
 
+      {/* Método de pago (solo Gasto): Cuenta o Tarjeta de crédito */}
+      {tipo === "Gasto" && (
+        <Field label="Pagar con">
+          <ChipGroup options={["cuenta", "tarjeta"]} value={metodoPago} onChange={setMetodoPago} getLabel={(v) => (v === "cuenta" ? "Cuenta / efectivo" : "Tarjeta de crédito")} />
+        </Field>
+      )}
+
       {/* Cuenta(s) como chips */}
-      <Field label={tipo === "Transferencia" ? "Cuenta de origen" : "Cuenta"}>
-        {cuentasDisponibles.length === 0 ? (
-          <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[moneda].toLowerCase()}. Agrega una desde la pestaña Cuentas.</p>
-        ) : (
-          <ChipGroup options={cuentasDisponibles.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />
-        )}
-      </Field>
+      {!pagaConTarjeta && (
+        <Field label={tipo === "Transferencia" ? "Cuenta de origen" : "Cuenta"}>
+          {cuentasDisponibles.length === 0 ? (
+            <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[moneda].toLowerCase()}. Agrega una desde la pestaña Cuentas.</p>
+          ) : (
+            <ChipGroup options={cuentasDisponibles.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />
+          )}
+        </Field>
+      )}
+
+      {pagaConTarjeta && (
+        <Field label="Tarjeta">
+          {tarjetasDisponibles.length === 0 ? (
+            <p className="text-sm text-rose-600">No tienes tarjetas en {CURRENCY_LABEL[moneda].toLowerCase()}. Agrega una desde la pestaña Cuentas.</p>
+          ) : (
+            <ChipGroup options={tarjetasDisponibles.map((c) => c.id)} value={tarjetaId} onChange={setTarjetaId} getLabel={(id) => tarjetasDisponibles.find((c) => c.id === id)?.nombre} />
+          )}
+        </Field>
+      )}
 
       {tipo === "Transferencia" && (
         <Field label="Cuenta de destino">
@@ -1756,7 +1761,7 @@ function TransactionModal({ accounts, onClose, onSave }) {
 
       <button
         onClick={handleSubmit}
-        disabled={!cuenta || !monto}
+        disabled={!monto || (pagaConTarjeta ? !tarjetaSeleccionada : !cuenta)}
         className="mt-2 w-full rounded-lg bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-700 disabled:opacity-50"
       >
         Guardar movimiento
@@ -1769,86 +1774,88 @@ function TransactionModal({ accounts, onClose, onSave }) {
 /*  Modal: Nuevo préstamo / Liquidar préstamo                           */
 /* ------------------------------------------------------------------ */
 
-function LoanModal({ accounts, onClose, onSave }) {
-  const [tipo, setTipo] = useState("Presté");
-  const [persona, setPersona] = useState("");
-  const [moneda, setMoneda] = useState("PEN");
-  const [monto, setMonto] = useState("");
-  const [fecha, setFecha] = useState(todayISO());
-  const [descripcion, setDescripcion] = useState("");
-  const [tasaInteres, setTasaInteres] = useState("");
-  const [tipoTasa, setTipoTasa] = useState("anual");
-  const [numCuotas, setNumCuotas] = useState("");
-  const [cuotaMonto, setCuotaMonto] = useState("");
-  const [fechaPago, setFechaPago] = useState("");
+function LoanModal({ accounts, onClose, onSave, initial }) {
+  const isEdit = !!initial;
+  const [tipo, setTipo] = useState(initial?.tipo || "Presté");
+  const [persona, setPersona] = useState(initial?.persona || "");
+  const [moneda, setMoneda] = useState(initial?.moneda || "PEN");
+  const [monto, setMonto] = useState(initial ? String(initial.monto) : "");
+  const [fecha, setFecha] = useState(initial?.fecha || todayISO());
+  const [descripcion, setDescripcion] = useState(initial?.descripcion || "");
+  const [conCuotas, setConCuotas] = useState(!!(initial && initial.numCuotas > 0));
+  const [tasaInteres, setTasaInteres] = useState(initial?.tasaInteres ? String(initial.tasaInteres) : "");
+  const [numCuotas, setNumCuotas] = useState(initial?.numCuotas ? String(initial.numCuotas) : "");
+  const [fechaPrimeraCuota, setFechaPrimeraCuota] = useState(initial?.fechaPrimeraCuota || initial?.fecha || todayISO());
   const cuentasDisponibles = accounts.filter((a) => (a.monedas || ["PEN"]).includes(moneda));
-  const [cuenta, setCuenta] = useState("");
+  const [cuenta, setCuenta] = useState(initial?.cuenta || "");
 
   useEffect(() => {
+    if (isEdit) return;
     if (!cuentasDisponibles.find((a) => a.nombre === cuenta)) setCuenta(cuentasDisponibles[0]?.nombre || "");
   }, [moneda]);
 
-  const cuotaCalculada = calcCuota(monto, tasaInteres, numCuotas, tipoTasa);
-
-  const handleCalcularCuota = () => {
-    setCuotaMonto(cuotaCalculada ? cuotaCalculada.toFixed(2) : "");
-  };
+  const montoNum = Number(monto) || 0;
+  const tasaNum = Number(tasaInteres) || 0;
+  const cuotasNum = Number(numCuotas) || 0;
+  const cuotaMensual = conCuotas && cuotasNum > 0 ? calcularCuotaMensual(montoNum, tasaNum, cuotasNum) : 0;
 
   const handleSubmit = () => {
-    if (!persona || !monto || Number(monto) <= 0 || !cuenta) return;
+    if (!persona || !montoNum || !(isEdit || cuenta)) return;
     onSave({
       tipo,
       persona,
-      monto: Number(monto),
+      monto: montoNum,
       moneda,
       cuenta,
       fecha,
       descripcion,
-      tasaInteres: Number(tasaInteres) || 0,
-      tipoTasa,
-      numCuotas: Number(numCuotas) || 0,
-      cuotaMonto: Number(cuotaMonto) || 0,
-      fechaPago,
+      tasaInteres: conCuotas ? tasaNum : 0,
+      numCuotas: conCuotas ? cuotasNum : 0,
+      fechaPrimeraCuota: conCuotas ? fechaPrimeraCuota : null,
     });
   };
 
   return (
-    <Modal title="Nuevo préstamo" onClose={onClose}>
-      <Field label="Tipo">
-        <div className="grid grid-cols-2 gap-2">
-          {[
-            { v: "Presté", label: "Yo presté", sub: "Tu dinero sale de una cuenta" },
-            { v: "Me prestaron", label: "Me prestaron", sub: "El dinero entra a una cuenta" },
-          ].map((o) => (
-            <button
-              key={o.v}
-              type="button"
-              onClick={() => setTipo(o.v)}
-              className={`rounded-xl border-2 p-3 text-left text-sm ${tipo === o.v ? "border-teal-600 bg-teal-50" : "border-stone-200"}`}
-            >
-              <div className="font-medium text-stone-800">{o.label}</div>
-              <div className="text-xs text-stone-500">{o.sub}</div>
-            </button>
-          ))}
-        </div>
-      </Field>
+    <Modal title={isEdit ? "Editar préstamo" : "Nuevo préstamo"} onClose={onClose}>
+      {!isEdit && (
+        <Field label="Tipo">
+          <div className="grid grid-cols-2 gap-2">
+            {[
+              { v: "Presté", label: "Yo presté", sub: "Tu dinero sale de una cuenta" },
+              { v: "Me prestaron", label: "Me prestaron", sub: "El dinero entra a una cuenta" },
+            ].map((o) => (
+              <button
+                key={o.v}
+                type="button"
+                onClick={() => setTipo(o.v)}
+                className={`rounded-xl border-2 p-3 text-left text-sm ${tipo === o.v ? "border-teal-600 bg-teal-50" : "border-stone-200"}`}
+              >
+                <div className="font-medium text-stone-800">{o.label}</div>
+                <div className="text-xs text-stone-500">{o.sub}</div>
+              </button>
+            ))}
+          </div>
+        </Field>
+      )}
 
       <Field label="¿Con quién?">
         <input value={persona} onChange={(e) => setPersona(e.target.value)} className={inputCls} placeholder="Nombre de la persona" />
       </Field>
 
       <div className="mb-4 flex items-center gap-2 rounded-xl border border-stone-200 bg-stone-50 px-4 py-3">
-        <ChipGroup options={["PEN", "USD"]} value={moneda} onChange={setMoneda} getLabel={(m) => CURRENCY_SYMBOL[m]} />
+        {isEdit ? <CurrencyBadge moneda={moneda} /> : <ChipGroup options={["PEN", "USD"]} value={moneda} onChange={setMoneda} getLabel={(m) => CURRENCY_SYMBOL[m]} />}
         <input type="number" step="0.01" min="0" value={monto} onChange={(e) => setMonto(e.target.value)} placeholder="0.00" className="flex-1 bg-transparent text-right font-mono text-2xl font-semibold text-stone-900 outline-none" />
       </div>
 
-      <Field label="Cuenta">
-        {cuentasDisponibles.length === 0 ? (
-          <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[moneda].toLowerCase()}.</p>
-        ) : (
-          <ChipGroup options={cuentasDisponibles.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />
-        )}
-      </Field>
+      {!isEdit && (
+        <Field label="Cuenta">
+          {cuentasDisponibles.length === 0 ? (
+            <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[moneda].toLowerCase()}.</p>
+          ) : (
+            <ChipGroup options={cuentasDisponibles.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />
+          )}
+        </Field>
+      )}
 
       <Field label="Fecha">
         <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className={inputCls} />
@@ -1858,136 +1865,40 @@ function LoanModal({ accounts, onClose, onSave }) {
         <input value={descripcion} onChange={(e) => setDescripcion(e.target.value)} className={inputCls} placeholder="Ej. para el pasaje del bus" />
       </Field>
 
-      <div className="mb-4 rounded-xl border border-stone-200 p-3">
-        <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-stone-500">Intereses y cuotas (opcional)</div>
-        <Field label="Tipo de tasa">
-          <ChipGroup
-            options={["anual", "mensual"]}
-            value={tipoTasa}
-            onChange={setTipoTasa}
-            getLabel={(t) => (t === "anual" ? "Anual (TCEA)" : "Mensual (TCEM)")}
-          />
-        </Field>
-        <div className="grid grid-cols-2 gap-2">
-          <Field label={tipoTasa === "anual" ? "Tasa de costo efectiva anual (%)" : "Tasa de costo efectiva mensual (%)"}>
-            <input type="number" step="0.01" min="0" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} placeholder={tipoTasa === "anual" ? "Ej. 24" : "Ej. 1.8"} />
-          </Field>
-          <Field label="N° de cuotas">
-            <input type="number" step="1" min="0" value={numCuotas} onChange={(e) => setNumCuotas(e.target.value)} className={inputCls} placeholder="Ej. 12" />
-          </Field>
-        </div>
-        <Field label="Monto de la cuota">
-          <div className="flex items-center gap-2">
-            <input type="number" step="0.01" min="0" value={cuotaMonto} onChange={(e) => setCuotaMonto(e.target.value)} className={inputCls} placeholder="0.00" />
-            <button
-              type="button"
-              onClick={handleCalcularCuota}
-              disabled={!monto || !numCuotas}
-              className="whitespace-nowrap rounded-lg border border-teal-600 px-3 py-2 text-xs font-medium text-teal-700 hover:bg-teal-50 disabled:opacity-40"
-            >
-              Calcular
-            </button>
+      <Field label="¿Tiene interés y cuotas?">
+        <ChipGroup options={[false, true]} value={conCuotas} onChange={setConCuotas} getLabel={(v) => (v ? "Sí, con cuotas" : "No, pago único")} />
+      </Field>
+
+      {conCuotas && (
+        <div className="mb-4 rounded-xl border border-stone-200 p-3">
+          <div className="grid grid-cols-2 gap-2">
+            <Field label="Tasa de interés anual (TEA %)">
+              <input type="number" step="0.01" min="0" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} placeholder="Ej. 45" />
+            </Field>
+            <Field label="Número de cuotas">
+              <input type="number" step="1" min="1" value={numCuotas} onChange={(e) => setNumCuotas(e.target.value)} className={inputCls} placeholder="Ej. 12" />
+            </Field>
           </div>
-          {!!monto && !!numCuotas && (
-            <p className="mt-1 text-xs text-stone-400">
-              Sugerido: {fmt(cuotaCalculada, moneda)} / mes (sistema francés). Puedes ajustarlo manualmente.
-            </p>
+          <Field label="Fecha de la primera cuota">
+            <input type="date" value={fechaPrimeraCuota} onChange={(e) => setFechaPrimeraCuota(e.target.value)} className={inputCls} />
+          </Field>
+          {montoNum > 0 && cuotasNum > 0 && (
+            <div className="mt-1 rounded-lg bg-teal-50 p-3 text-sm text-teal-800">
+              <div className="flex justify-between">
+                <span>Cuota mensual estimada</span>
+                <span className="font-mono font-semibold">{fmt(cuotaMensual, moneda)}</span>
+              </div>
+              <div className="mt-1 flex justify-between text-xs text-teal-700">
+                <span>Total a pagar con interés</span>
+                <span className="font-mono">{fmt(cuotaMensual * cuotasNum, moneda)}</span>
+              </div>
+            </div>
           )}
-        </Field>
-        <Field label="Fecha de pago (próxima cuota)">
-          <input type="date" value={fechaPago} onChange={(e) => setFechaPago(e.target.value)} className={inputCls} />
-        </Field>
-      </div>
-
-      <button onClick={handleSubmit} disabled={!cuenta || !monto || !persona} className="mt-2 w-full rounded-lg bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-700 disabled:opacity-50">
-        Guardar préstamo
-      </button>
-    </Modal>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/*  Modal: Editar intereses y cuotas de un préstamo                     */
-/* ------------------------------------------------------------------ */
-
-function EditLoanModal({ loan, onClose, onSave }) {
-  const [tasaInteres, setTasaInteres] = useState(loan.tasaInteres || "");
-  const [tipoTasa, setTipoTasa] = useState(loan.tipoTasa || "anual");
-  const [numCuotas, setNumCuotas] = useState(loan.numCuotas || "");
-  const [cuotaMonto, setCuotaMonto] = useState(loan.cuotaMonto || "");
-  const [fechaPago, setFechaPago] = useState(loan.fechaPago || "");
-  const [descripcion, setDescripcion] = useState(loan.descripcion || "");
-
-  const cuotaCalculada = calcCuota(loan.monto, tasaInteres, numCuotas, tipoTasa);
-
-  const handleCalcularCuota = () => {
-    setCuotaMonto(cuotaCalculada ? cuotaCalculada.toFixed(2) : "");
-  };
-
-  const handleSubmit = () => {
-    onSave({
-      tasaInteres: Number(tasaInteres) || 0,
-      tipoTasa,
-      numCuotas: Number(numCuotas) || 0,
-      cuotaMonto: Number(cuotaMonto) || 0,
-      fechaPago,
-      descripcion,
-    });
-  };
-
-  return (
-    <Modal title={`Editar préstamo con ${loan.persona}`} onClose={onClose}>
-      <div className="mb-4 rounded-xl border border-stone-200 bg-stone-50 p-3 text-sm text-stone-600">
-        Monto: <span className="font-mono font-semibold text-stone-900">{fmt(loan.monto, loan.moneda)}</span>
-      </div>
-
-      <Field label="Tipo de tasa">
-        <ChipGroup
-          options={["anual", "mensual"]}
-          value={tipoTasa}
-          onChange={setTipoTasa}
-          getLabel={(t) => (t === "anual" ? "Anual (TCEA)" : "Mensual (TCEM)")}
-        />
-      </Field>
-
-      <div className="mb-4 grid grid-cols-2 gap-2">
-        <Field label={tipoTasa === "anual" ? "Tasa de costo efectiva anual (%)" : "Tasa de costo efectiva mensual (%)"}>
-          <input type="number" step="0.01" min="0" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} placeholder={tipoTasa === "anual" ? "Ej. 24" : "Ej. 1.8"} />
-        </Field>
-        <Field label="N° de cuotas">
-          <input type="number" step="1" min="0" value={numCuotas} onChange={(e) => setNumCuotas(e.target.value)} className={inputCls} placeholder="Ej. 12" />
-        </Field>
-      </div>
-
-      <Field label="Monto de la cuota">
-        <div className="flex items-center gap-2">
-          <input type="number" step="0.01" min="0" value={cuotaMonto} onChange={(e) => setCuotaMonto(e.target.value)} className={inputCls} placeholder="0.00" />
-          <button
-            type="button"
-            onClick={handleCalcularCuota}
-            disabled={!numCuotas}
-            className="whitespace-nowrap rounded-lg border border-teal-600 px-3 py-2 text-xs font-medium text-teal-700 hover:bg-teal-50 disabled:opacity-40"
-          >
-            Calcular
-          </button>
         </div>
-        {!!numCuotas && (
-          <p className="mt-1 text-xs text-stone-400">
-            Sugerido: {fmt(cuotaCalculada, loan.moneda)} / mes (sistema francés). Puedes ajustarlo manualmente.
-          </p>
-        )}
-      </Field>
+      )}
 
-      <Field label="Fecha de pago (próxima cuota)">
-        <input type="date" value={fechaPago} onChange={(e) => setFechaPago(e.target.value)} className={inputCls} />
-      </Field>
-
-      <Field label="Descripción (opcional)">
-        <input value={descripcion} onChange={(e) => setDescripcion(e.target.value)} className={inputCls} placeholder="Ej. para el pasaje del bus" />
-      </Field>
-
-      <button onClick={handleSubmit} className="mt-2 w-full rounded-lg bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-700">
-        Guardar cambios
+      <button onClick={handleSubmit} disabled={!persona || !monto || (!isEdit && !cuenta)} className="mt-2 w-full rounded-lg bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-700 disabled:opacity-50">
+        {isEdit ? "Guardar cambios" : "Guardar préstamo"}
       </button>
     </Modal>
   );
@@ -2010,6 +1921,37 @@ function SettleLoanModal({ loan, accounts, onClose, onConfirm }) {
       </Field>
       <button onClick={() => cuenta && onConfirm(cuenta, fecha)} disabled={!cuenta} className="mt-2 w-full rounded-lg bg-teal-600 py-2.5 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-50">
         Confirmar liquidación
+      </button>
+    </Modal>
+  );
+}
+
+function PayCardModal({ card, moneda, deudaActual, accounts, onClose, onConfirm }) {
+  const [cuenta, setCuenta] = useState(accounts[0]?.nombre || "");
+  const [monto, setMonto] = useState(deudaActual > 0 ? String(deudaActual.toFixed(2)) : "");
+  const [fecha, setFecha] = useState(todayISO());
+  const montoNum = Number(monto) || 0;
+
+  return (
+    <Modal title={`Pagar ${card.nombre}`} onClose={onClose}>
+      <p className="mb-4 text-sm text-stone-600">
+        Deuda actual en {CURRENCY_LABEL[moneda].toLowerCase()}: <span className="font-mono font-semibold">{fmt(deudaActual, moneda)}</span>. Elige de qué cuenta sale el pago.
+      </p>
+      <Field label="Cuenta de origen">
+        {accounts.length === 0 ? <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[moneda].toLowerCase()}.</p> : <ChipGroup options={accounts.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />}
+      </Field>
+      <Field label="Monto a pagar">
+        <input type="number" step="0.01" min="0" value={monto} onChange={(e) => setMonto(e.target.value)} className={inputCls} />
+      </Field>
+      <Field label="Fecha">
+        <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className={inputCls} />
+      </Field>
+      <button
+        onClick={() => cuenta && montoNum > 0 && onConfirm(cuenta, montoNum, fecha)}
+        disabled={!cuenta || montoNum <= 0}
+        className="mt-2 w-full rounded-lg bg-teal-600 py-2.5 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-50"
+      >
+        Confirmar pago
       </button>
     </Modal>
   );
