@@ -1,81 +1,114 @@
-# Control de Dinero
+# Despacho — App de pedidos (vendedores ↔ almacén)
 
-Dashboard personal de finanzas: cuentas, ingresos, gastos, presupuestos y tarjetas de crédito, con gráficos dinámicos. Es una página estática (sin backend propio ni paso de compilación) que guarda tus datos en **Firestore** (la base de datos en la nube de Firebase), ligados a tu cuenta — así puedes entrar desde el celular y la computadora y ver la misma información.
+Proyecto real con backend propio (Node.js) y base de datos en la nube (Supabase,
+basada en Postgres), para que los pedidos y el chat existan aunque tu PC esté
+apagada. El backend corre en tu PC por ahora; cuando quieras que funcione
+24/7, se sube gratis a un servicio como Render (ver el final de este documento).
 
-## Paso 1 — Crear tu proyecto de Firebase (gratis)
+## Estructura
 
-1. Ve a [console.firebase.google.com](https://console.firebase.google.com) e inicia sesión con tu cuenta de Google.
-2. **Añadir proyecto** → ponle un nombre (ej. "control-de-dinero") → puedes desactivar Google Analytics, no lo necesitas → **Crear proyecto**.
-3. En el menú lateral, entra a **Compilación → Authentication → Comenzar**.
-   - Pestaña **Sign-in method** → habilita **Correo electrónico/contraseña**.
-   - También habilita **Google** (así puedes entrar con un clic, sin crear contraseña nueva).
-4. Entra a **Compilación → Firestore Database → Crear base de datos**.
-   - Elige una ubicación (cualquiera cercana a Perú, ej. `southamerica-east1`).
-   - Empieza en **modo de producción** (le pondremos reglas propias en el paso 3).
-5. En **reglas de Firestore** (pestaña "Reglas" dentro de Firestore Database), reemplaza el contenido por:
-   ```
-   rules_version = '2';
-   service cloud.firestore {
-     match /databases/{database}/documents {
-       match /usuarios/{uid} {
-         allow read, write: if request.auth != null && request.auth.uid == uid;
-       }
-     }
-   }
-   ```
-   Esto asegura que cada persona solo puede leer y escribir su propio documento — nadie más puede ver tus datos, ni siquiera con la config pública del proyecto.
-6. Ve a **Configuración del proyecto** (ícono de engranaje arriba a la izquierda) → pestaña **General** → baja hasta "Tus apps" → clic en el ícono **`</>`** (Web) → ponle un apodo → **Registrar app**. Te mostrará un bloque `firebaseConfig` con tus claves (`apiKey`, `authDomain`, etc.) — cópialo, lo necesitas en el paso 2.
-
-## Paso 2 — Pegar tu configuración en el código
-
-Abre `app.js` y busca, cerca del inicio, este bloque:
-
-```js
-const firebaseConfig = {
-  apiKey: "TU_API_KEY",
-  authDomain: "TU_PROYECTO.firebaseapp.com",
-  projectId: "TU_PROYECTO",
-  storageBucket: "TU_PROYECTO.appspot.com",
-  messagingSenderId: "TU_SENDER_ID",
-  appId: "TU_APP_ID",
-};
+```
+proyecto/
+  backend/     → servidor Node.js (API + lectura de fotos con IA)
+  frontend/    → la página web (React)
 ```
 
-Reemplázalo por el `firebaseConfig` real que copiaste en el paso 1.6. Estos valores **no son secretos** (Google los diseñó para ir en el código del navegador) — lo que protege tus datos son las reglas de Firestore del paso 1.5, no ocultar esta config.
+---
 
-## Paso 3 — Publicar en GitHub Pages
+## Paso 1 — Crear el proyecto de Supabase (base de datos en la nube, gratis)
 
-1. Crea un repositorio en GitHub y sube `index.html`, `app.js` y este `README.md` a la raíz.
-   ```bash
-   git init
-   git add index.html app.js README.md
-   git commit -m "Control de dinero"
-   git branch -M main
-   git remote add origin https://github.com/TU-USUARIO/TU-REPO.git
-   git push -u origin main
-   ```
-2. En el repo: **Settings → Pages** → "Source": Deploy from a branch → rama `main`, carpeta `/(root)` → guardar.
-3. En uno o dos minutos tendrás tu URL: `https://TU-USUARIO.github.io/TU-REPO/`.
+1. Entra a https://supabase.com → **Start your project** → crea un proyecto
+   (puedes llamarlo "despacho-pedidos"). No necesitas tarjeta de crédito.
+2. **SQL Editor → New query**. Abre el archivo `backend/supabase-schema.sql`
+   de este proyecto, copia todo su contenido, pégalo ahí y dale **Run**.
+   Esto crea las tablas que la app necesita — se hace una sola vez.
+3. Ve a **⚙️ Project Settings → API**. Ahí copia (los necesitas en el paso 2):
+   - **Project URL**
+   - **service_role key** (la clave secreta, NO la "anon public")
 
-## Paso 4 — Autorizar tu dominio en Firebase (para el login con Google)
+   ⚠️ La `service_role key` es una credencial sensible — no la compartas ni
+   la subas a un repositorio público. Le da acceso total a la base de datos.
 
-Firebase solo permite iniciar sesión desde dominios que tú autorices:
+## Paso 2 — Configurar el backend
 
-1. En Firebase Console → **Authentication → Settings → Authorized domains**.
-2. Agrega `TU-USUARIO.github.io` (sin `https://` ni la ruta del repo).
+```bash
+cd backend
+npm install
+cp .env.example .env
+```
 
-Sin este paso, el botón "Continuar con Google" mostrará un error de dominio no autorizado — el login con correo y contraseña funciona igual sin este paso.
+Abre `.env` y completa:
+- `GEMINI_API_KEY` → tu clave gratis de https://aistudio.google.com/apikey
+  (necesaria para que la app lea las fotos de los pedidos)
+- `SUPABASE_URL` → el "Project URL" del paso 1
+- `SUPABASE_SERVICE_ROLE_KEY` → la "service_role key" del paso 1
+
+Luego corre el servidor:
+
+```bash
+npm run dev
+```
+
+Debe aparecer: `Supabase conectado correctamente.` y luego
+`Backend de Despacho corriendo en http://localhost:4000`
+
+## Paso 3 — Configurar el frontend
+
+En otra terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Se abrirá en `http://localhost:5173`. Ábrelo en tu navegador — esa es la app.
+
+Para que otros dispositivos en tu misma red (celulares de vendedores/almacén)
+la usen mientras tu PC está prendida y corriendo el backend, usa la IP de tu
+PC en la red local, por ejemplo `http://192.168.1.20:5173`, y ajusta
+`FRONTEND_ORIGIN` en `backend/.env` con esa misma dirección.
+
+---
 
 ## Cómo usarla
 
-- La primera vez, crea tu cuenta (con Google o con correo/contraseña) — es tu login personal, nadie más puede entrar a tus datos.
-- Desde cualquier dispositivo, entra con la misma cuenta y verás la misma información: se sincroniza sola cada vez que agregas o editas algo (el sidebar muestra "Guardando en la nube…" / "Sincronizado ✓").
-- El desglose "¿En qué gastas más?" en el Resumen te muestra cada categoría con su porcentaje del gasto total del mes, junto con el gráfico de 6 meses para ver la tendencia.
+1. Cada persona entra, pone su nombre/correo y elige si es **Vendedor** o
+   **Almacenero** (login simple por ahora, sin contraseña).
+2. El vendedor crea un pedido: nombre del cliente + foto de la lista (a mano
+   o captura de Excel). La IA la transcribe y contrasta cada código contra tu
+   catálogo (`backend/src/codigos.json`, ~20,000 códigos).
+3. El almacenero revisa el pedido, marca check/equis por código, pone la
+   cantidad de cajas y finaliza. Esto notifica al vendedor.
+4. Cualquiera puede descargar las etiquetas de las cajas (una imagen por
+   caja) desde el detalle del pedido ya finalizado.
+5. Cada pedido tiene su propio chat, guardado, para dudas de stock.
 
-## Costos
+## Pendiente conocido: columna "Piso"
 
-El plan gratuito de Firebase (Spark) incluye 50,000 lecturas y 20,000 escrituras al día en Firestore, y autenticación ilimitada — para uso personal jamás lo vas a alcanzar. No requiere tarjeta de crédito para el plan gratuito.
+Tu catálogo de códigos (`backend/src/codigos.json`) por ahora solo tiene los
+códigos — sin el dato de "piso" ni nombre de producto. Por eso ese campo
+queda vacío/editable a mano en el checklist. Cuando tengas la lista completa
+con código + piso (+ idealmente nombre de producto), se puede reemplazar ese
+archivo por una tabla real y el piso se completará solo. Avísame y lo dejamos
+listo.
 
-## Editar o personalizar
+## Siguiente paso: login con Google real
 
-Todo el código vive en `app.js` (React sin build, Tailwind por CDN para estilos). Puedes editar categorías, colores, textos, etc. y volver a subir el archivo — GitHub Pages se actualiza solo con cada push a `main`.
+Cuando quieras reemplazar el login simple por un "Iniciar sesión con Google"
+de verdad (solo para identificar, sin permisos extra, tal como pediste),
+necesitas:
+1. Crear un proyecto en https://console.cloud.google.com
+2. Ir a **APIs & Services → Credentials → Create OAuth Client ID** (tipo
+   "Web application").
+3. Pasarme el **Client ID** que te da — con eso conecto el botón real de
+   Google en el login.
+
+## Siguiente paso: que funcione sin depender de tu PC
+
+Ahora mismo el frontend y el backend corren en tu PC. La base de datos ya
+está en la nube (Supabase), pero para que la app entera funcione con tu PC
+apagada, el backend también debe subirse a un servicio en la nube. La forma
+más simple y gratuita: **Render.com** (o Railway) — subes la carpeta
+`backend/`, configuras las mismas variables de entorno del `.env`, y te da
+una URL pública. Cuando quieras dar ese paso, te guío con el detalle.
