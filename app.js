@@ -224,6 +224,44 @@ function proximaCuotaInfo(loan) {
   return { completado: false, numero: idxPendiente + 1, fecha: fechas[idxPendiente] };
 }
 
+// Dado un día de corte/pago de tarjeta (una fecha "semilla"), calcula automáticamente la próxima
+// ocurrencia de ese mismo día del mes, avanzando mes a mes desde la fecha registrada. Así, una vez
+// que registras la tarjeta con su fecha de corte/pago, no hace falta volver a escribirla cada mes:
+// la app siempre calcula sola cuál es el próximo corte y el próximo pago.
+function proximaFechaMensual(fechaBase) {
+  if (!fechaBase) return null;
+  const base = new Date(fechaBase + "T00:00:00");
+  if (isNaN(base.getTime())) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const dia = base.getDate();
+  const next = new Date(base);
+  while (next < today) {
+    next.setMonth(next.getMonth() + 1);
+    // Si el mes no tiene ese día (ej. 31 en febrero), setMonth lo desborda al mes siguiente;
+    // forzamos el día para que siempre caiga en el mismo día del mes que registraste.
+    next.setDate(Math.min(dia, new Date(next.getFullYear(), next.getMonth() + 1, 0).getDate()));
+  }
+  return next.toISOString().slice(0, 10);
+}
+
+// Normaliza el saldo/línea/pago mínimo de una tarjeta a un solo monto en soles, sin importar si
+// consume en soles, en dólares, o en ambas (todo el consumo de una tarjeta física es una sola
+// deuda; solo la moneda de cada compra individual varía). Además de soportar el modelo nuevo
+// (campos planos en soles), sigue leyendo el modelo anterior por-moneda de tarjetas ya guardadas.
+function cardEnSoles(c, tipoCambio) {
+  if (c.porMoneda) {
+    const pen = c.porMoneda.PEN || {};
+    const usd = c.porMoneda.USD || {};
+    return {
+      limite: (pen.limite || 0) + (usd.limite || 0) * tipoCambio,
+      saldoActual: (pen.saldoActual || 0) + (usd.saldoActual || 0) * tipoCambio,
+      pagoMinimo: (pen.pagoMinimo || 0) + (usd.pagoMinimo || 0) * tipoCambio,
+    };
+  }
+  return { limite: c.limite || 0, saldoActual: c.saldoActual || 0, pagoMinimo: c.pagoMinimo || 0 };
+}
+
 /* ------------------------------------------------------------------ */
 /*  Gráficos en SVG puro (sin dependencias externas)                    */
 /* ------------------------------------------------------------------ */
@@ -640,9 +678,10 @@ function FinanceDashboard({ user }) {
   const [showAccModal, setShowAccModal] = useState(false);
   const [showLoanModal, setShowLoanModal] = useState(false);
   const [settlingLoan, setSettlingLoan] = useState(null);
-  const [payingCard, setPayingCard] = useState(null); // { card, moneda }
+  const [payingCard, setPayingCard] = useState(null); // tarjeta que se está pagando (deuda siempre en soles)
   const [editingLoan, setEditingLoan] = useState(null);
   const [editingAccount, setEditingAccount] = useState(null);
+  const [editingCard, setEditingCard] = useState(null);
   const [editingTx, setEditingTx] = useState(null);
   const [confirmState, setConfirmState] = useState(null); // { title, message, confirmLabel, onConfirm }
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -698,21 +737,22 @@ function FinanceDashboard({ user }) {
     return balances;
   }, [accounts, transactions]);
 
-  // Deuda de cada tarjeta = saldo inicial que le pusiste al crearla + gastos pagados con
-  // ella - pagos que le hiciste, todo calculado por separado en soles y dólares.
+  // Deuda de cada tarjeta = saldo inicial que le pusiste al crearla + gastos pagados con ella -
+  // pagos que le hiciste. Es UN SOLO saldo en soles por tarjeta: si pagas un gasto en dólares con
+  // la tarjeta, ese consumo se convierte a soles (con el tipo de cambio vigente al momento del
+  // gasto) y se suma a la misma deuda, en vez de llevar dos saldos separados por moneda.
   const cardDebt = useMemo(() => {
     const debt = {};
     cards.forEach((c) => {
-      debt[c.id] = { PEN: c.porMoneda?.PEN?.saldoActual || 0, USD: c.porMoneda?.USD?.saldoActual || 0 };
+      debt[c.id] = cardEnSoles(c, settings.tipoCambio).saldoActual;
     });
     transactions.forEach((t) => {
-      if (!t.tarjetaId || !debt[t.tarjetaId]) return;
-      const m = t.moneda || "PEN";
-      if (t.tipo === "Gasto" && t.esTarjeta) debt[t.tarjetaId][m] += t.monto;
-      else if (t.tipo === "PagoTarjeta") debt[t.tarjetaId][m] -= t.monto;
+      if (!t.tarjetaId || debt[t.tarjetaId] === undefined) return;
+      if (t.tipo === "Gasto" && t.esTarjeta) debt[t.tarjetaId] += toSoles(t);
+      else if (t.tipo === "PagoTarjeta") debt[t.tarjetaId] -= toSoles(t);
     });
     return debt;
-  }, [cards, transactions]);
+  }, [cards, transactions, settings.tipoCambio, toSoles]);
 
   const availableMonths = useMemo(() => {
     const set = new Set(transactions.map((t) => monthKey(t.fecha)));
@@ -743,7 +783,7 @@ function FinanceDashboard({ user }) {
   const totalUSD = accounts.reduce((s, a) => s + (accountBalances[a.nombre]?.USD || 0), 0);
   const patrimonioSoles = totalPEN + totalUSD * settings.tipoCambio;
 
-  const deudaTarjetasSoles = cards.reduce((s, c) => s + (cardDebt[c.id]?.PEN || 0) + (cardDebt[c.id]?.USD || 0) * settings.tipoCambio, 0);
+  const deudaTarjetasSoles = cards.reduce((s, c) => s + (cardDebt[c.id] || 0), 0);
   // Ratio deuda de tarjetas / ingresos del mes: una señal rápida de qué tan comprometidos están
   // tus ingresos frente a tu deuda de consumo. Por encima de ~30-36% suele considerarse alto.
   const ratioDeudaIngreso = ingresosMes > 0 ? (deudaTarjetasSoles / ingresosMes) * 100 : null;
@@ -819,23 +859,26 @@ function FinanceDashboard({ user }) {
     [budgets, realExpenseTx, toSoles]
   );
 
+  // Vista unificada de cada tarjeta: un solo saldo/línea/% de uso en soles (sin importar si la
+  // tarjeta acepta consumos en soles, en dólares, o en ambos), más las próximas fechas de corte y
+  // pago calculadas automáticamente mes a mes a partir de la fecha que registraste.
   const cardsWithUtil = useMemo(
     () =>
       cards.map((c) => {
-        const saldoPEN = cardDebt[c.id]?.PEN || 0;
-        const saldoUSD = cardDebt[c.id]?.USD || 0;
+        const base = cardEnSoles(c, settings.tipoCambio);
+        const saldoActual = cardDebt[c.id] || 0;
+        const util = base.limite > 0 ? (saldoActual / base.limite) * 100 : 0;
         return {
           ...c,
-          porMoneda: {
-            ...(c.porMoneda || {}),
-            ...(c.porMoneda?.PEN ? { PEN: { ...c.porMoneda.PEN, saldoActual: saldoPEN } } : {}),
-            ...(c.porMoneda?.USD ? { USD: { ...c.porMoneda.USD, saldoActual: saldoUSD } } : {}),
-          },
-          utilPEN: c.porMoneda?.PEN?.limite > 0 ? (saldoPEN / c.porMoneda.PEN.limite) * 100 : 0,
-          utilUSD: c.porMoneda?.USD?.limite > 0 ? (saldoUSD / c.porMoneda.USD.limite) * 100 : 0,
+          limite: base.limite,
+          saldoActual,
+          pagoMinimo: base.pagoMinimo,
+          util,
+          proximaFechaCorte: proximaFechaMensual(c.fechaCorte),
+          proximaFechaPago: proximaFechaMensual(c.fechaPago),
         };
       }),
-    [cards, cardDebt]
+    [cards, cardDebt, settings.tipoCambio]
   );
 
   const loansPendientes = loans.filter((l) => l.estado === "Pendiente");
@@ -859,11 +902,10 @@ function FinanceDashboard({ user }) {
       else if (b.presupuesto > 0 && b.pct >= 80) list.push({ type: "warn", text: `Presupuesto "${b.categoria}" al ${b.pct.toFixed(0)}%` });
     });
     cardsWithUtil.forEach((c) => {
-      if (c.utilPEN >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.utilPEN.toFixed(0)}% de uso en soles` });
-      if (c.utilUSD >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.utilUSD.toFixed(0)}% de uso en dólares` });
-      if (c.fechaPago) {
-        const days = Math.ceil((new Date(c.fechaPago) - new Date()) / 86400000);
-        if (days >= 0 && days <= 7) list.push({ type: "warn", text: `Pago de ${c.nombre} vence en ${days} día(s)` });
+      if (c.util >= 80) list.push({ type: "danger", text: `Tarjeta ${c.nombre} con ${c.util.toFixed(0)}% de uso de su línea` });
+      if (c.proximaFechaPago) {
+        const days = Math.ceil((new Date(c.proximaFechaPago + "T00:00:00") - new Date()) / 86400000);
+        if (days >= 0 && days <= 7 && c.saldoActual > 0) list.push({ type: "warn", text: `Pago de ${c.nombre} vence en ${days} día(s) (${fmt(c.saldoActual)})` });
       }
     });
     if (loansPendientes.length > 0) {
@@ -881,8 +923,10 @@ function FinanceDashboard({ user }) {
   const addTransaction = (tx) => setTransactions((prev) => [{ id: uid(), tipoCambioUsado: tipoCambioUsado(tx.moneda), ...tx }, ...prev]);
   const updateTransaction = (id, tx) =>
     setTransactions((prev) => prev.map((t) => (t.id === id ? { ...t, ...tx, id, tipoCambioUsado: tx.moneda === "USD" ? t.tipoCambioUsado || tipoCambioUsado(tx.moneda) : undefined } : t)));
-  const payCard = (card, moneda, cuenta, monto, fecha) => {
-    addTransaction({ tipo: "PagoTarjeta", cuenta, tarjetaId: card.id, moneda, monto, fecha, grupo: "Pago de tarjeta", categoria: "Pago de tarjeta", descripcion: `Pago tarjeta ${card.nombre}`, recurrente: "NO" });
+  // El pago de tarjeta siempre se registra en soles: la deuda de la tarjeta es un único saldo en
+  // soles aunque haya consumos en dólares (se convierten al registrarse el gasto).
+  const payCard = (card, cuenta, monto, fecha) => {
+    addTransaction({ tipo: "PagoTarjeta", cuenta, tarjetaId: card.id, moneda: "PEN", monto, fecha, grupo: "Pago de tarjeta", categoria: "Pago de tarjeta", descripcion: `Pago tarjeta ${card.nombre}`, recurrente: "NO" });
     setPayingCard(null);
   };
   const deleteTransaction = (id) => setTransactions((prev) => prev.filter((t) => t.id !== id));
@@ -897,6 +941,9 @@ function FinanceDashboard({ user }) {
     });
   const updateBudget = (id, presupuesto) => setBudgets((prev) => prev.map((b) => (b.id === id ? { ...b, presupuesto } : b)));
   const addCard = (card) => setCards((prev) => [...prev, { id: uid(), ...card }]);
+  // Guarda la tarjeta ya en el modelo nuevo (campos planos en soles), reemplazando cualquier
+  // "porMoneda" que tuviera de antes: así queda migrada la primera vez que la editas y guardas.
+  const updateCard = (id, data) => setCards((prev) => prev.map((c) => (c.id === id ? { id, ...data } : c)));
   const deleteCard = (id) => setCards((prev) => prev.filter((c) => c.id !== id));
   const requestDeleteCard = (c) =>
     setConfirmState({
@@ -1234,8 +1281,9 @@ function FinanceDashboard({ user }) {
               onEditAccount={(a) => setEditingAccount(a)}
               onDeleteAccount={requestDeleteAccount}
               onAddCard={() => setShowCardModal(true)}
+              onEditCard={(c) => setEditingCard(c)}
               onDeleteCard={requestDeleteCard}
-              onPayCard={(card, moneda) => setPayingCard({ card, moneda })}
+              onPayCard={(card) => setPayingCard(card)}
               settings={settings}
               setSettings={setSettings}
             />
@@ -1260,12 +1308,19 @@ function FinanceDashboard({ user }) {
           }}
         />
       )}
-      {showCardModal && (
+      {(showCardModal || editingCard) && (
         <CardModal
-          onClose={() => setShowCardModal(false)}
-          onSave={(c) => {
-            addCard(c);
+          initial={editingCard}
+          tipoCambio={settings.tipoCambio}
+          onClose={() => {
             setShowCardModal(false);
+            setEditingCard(null);
+          }}
+          onSave={(c) => {
+            if (editingCard) updateCard(editingCard.id, c);
+            else addCard(c);
+            setShowCardModal(false);
+            setEditingCard(null);
           }}
         />
       )}
@@ -1315,12 +1370,11 @@ function FinanceDashboard({ user }) {
       )}
       {payingCard && (
         <PayCardModal
-          card={payingCard.card}
-          moneda={payingCard.moneda}
-          deudaActual={cardDebt[payingCard.card.id]?.[payingCard.moneda] || 0}
-          accounts={accounts.filter((a) => (a.monedas || []).includes(payingCard.moneda))}
+          card={payingCard}
+          deudaActual={cardDebt[payingCard.id] || 0}
+          accounts={accounts.filter((a) => (a.monedas || []).includes("PEN"))}
           onClose={() => setPayingCard(null)}
-          onConfirm={(cuenta, monto, fecha) => payCard(payingCard.card, payingCard.moneda, cuenta, monto, fecha)}
+          onConfirm={(cuenta, monto, fecha) => payCard(payingCard, cuenta, monto, fecha)}
         />
       )}
       {confirmState && (
@@ -1809,7 +1863,7 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onEdit, onDelete
 /*  Tab: Cuentas y tarjetas de crédito (unificado)                      */
 /* ------------------------------------------------------------------ */
 
-function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, onEditAccount, onDeleteAccount, onAddCard, onDeleteCard, onPayCard, settings, setSettings }) {
+function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, onEditAccount, onDeleteAccount, onAddCard, onEditCard, onDeleteCard, onPayCard, settings, setSettings }) {
   return (
     <div className="space-y-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1890,51 +1944,53 @@ function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, on
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {cardsWithUtil.map((c) => (
               <div key={c.id} className="relative overflow-hidden rounded-2xl border border-stone-200 bg-gradient-to-br from-stone-900 to-stone-700 p-5 text-white shadow-sm">
-                <button onClick={() => onDeleteCard(c)} aria-label="Eliminar tarjeta" className="absolute right-3 top-3 rounded p-1 text-stone-300 hover:bg-white/10 hover:text-white">
-                  <Ico name="Trash2" size={14} />
-                </button>
+                <div className="absolute right-3 top-3 flex gap-1">
+                  <button onClick={() => onEditCard(c)} aria-label="Editar tarjeta" className="rounded p-1 text-stone-300 hover:bg-white/10 hover:text-white">
+                    <Ico name="Pencil" size={14} />
+                  </button>
+                  <button onClick={() => onDeleteCard(c)} aria-label="Eliminar tarjeta" className="rounded p-1 text-stone-300 hover:bg-white/10 hover:text-white">
+                    <Ico name="Trash2" size={14} />
+                  </button>
+                </div>
                 <div className="text-xs uppercase tracking-wide text-stone-300">{c.banco}</div>
                 <div className="mb-4 font-serif text-lg">{c.nombre}</div>
 
-                {["PEN", "USD"].filter((m) => c.porMoneda?.[m]).map((m) => {
-                  const d = c.porMoneda[m];
-                  const util = m === "PEN" ? c.utilPEN : c.utilUSD;
-                  return (
-                    <div key={m} className="mb-3 border-t border-white/10 pt-3 first:border-0 first:pt-0">
-                      <div className="mb-1 flex items-end justify-between">
-                        <span className="text-xs text-stone-300">Saldo actual ({CURRENCY_LABEL[m]})</span>
-                        <span className="font-mono text-lg font-semibold">{fmt(d.saldoActual, m)}</span>
-                      </div>
-                      <div className="mb-1 text-xs text-stone-300">Línea: {fmt(d.limite, m)}</div>
-                      <div className="mb-1 h-1.5 w-full overflow-hidden rounded-full bg-white/20">
-                        <div className={`h-full rounded-full ${util >= 80 ? "bg-rose-400" : util >= 50 ? "bg-amber-400" : "bg-teal-400"}`} style={{ width: `${Math.min(100, util)}%` }} />
-                      </div>
-                      <div className="mb-2 text-xs text-stone-300">
-                        {util.toFixed(0)}% utilizado{d.pagoMinimo ? ` · mín. ${fmt(d.pagoMinimo, m)}` : ""}
-                      </div>
-                      {d.saldoActual > 0 && (
-                        <button onClick={() => onPayCard(c, m)} className="w-full rounded-lg bg-white/10 py-1.5 text-xs font-medium text-white hover:bg-white/20">
-                          Pagar esta tarjeta
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
+                <div className="border-t border-white/10 pt-3 first:border-0 first:pt-0">
+                  <div className="mb-1 flex items-end justify-between">
+                    <span className="text-xs text-stone-300">Saldo actual (un solo saldo en soles)</span>
+                    <span className="font-mono text-lg font-semibold">{fmt(c.saldoActual)}</span>
+                  </div>
+                  <div className="mb-1 text-xs text-stone-300">Línea: {fmt(c.limite)}</div>
+                  <div className="mb-1 h-1.5 w-full overflow-hidden rounded-full bg-white/20">
+                    <div className={`h-full rounded-full ${c.util >= 80 ? "bg-rose-400" : c.util >= 50 ? "bg-amber-400" : "bg-teal-400"}`} style={{ width: `${Math.min(100, c.util)}%` }} />
+                  </div>
+                  <div className="mb-2 text-xs text-stone-300">
+                    {c.util.toFixed(0)}% utilizado{c.pagoMinimo ? ` · mín. ${fmt(c.pagoMinimo)}` : ""}
+                  </div>
+                  {c.saldoActual > 0 && (
+                    <button onClick={() => onPayCard(c)} className="w-full rounded-lg bg-white/10 py-1.5 text-xs font-medium text-white hover:bg-white/20">
+                      Pagar esta tarjeta
+                    </button>
+                  )}
+                </div>
 
                 <div className="mt-3 grid grid-cols-2 gap-2 border-t border-white/10 pt-3 text-xs">
                   <div>
-                    <div className="text-stone-400">Fecha de corte</div>
-                    <div>{c.fechaCorte || "—"}</div>
+                    <div className="text-stone-400">Próximo corte</div>
+                    <div>{c.proximaFechaCorte || "—"}</div>
                   </div>
                   <div>
-                    <div className="text-stone-400">Fecha de pago</div>
-                    <div>{c.fechaPago || "—"}</div>
+                    <div className="text-stone-400">Próximo pago</div>
+                    <div>{c.proximaFechaPago || "—"}</div>
                   </div>
                   <div className="col-span-2">
                     <div className="text-stone-400">TCEA</div>
                     <div>{c.tasaInteres ? `${c.tasaInteres}%` : "—"}</div>
                   </div>
                 </div>
+                {c.fechaCorte && (
+                  <div className="mt-2 text-[10px] leading-snug text-stone-400">Se calcula sola cada mes desde el {c.fechaCorte.slice(-2)} de corte y el {c.fechaPago ? c.fechaPago.slice(-2) : "—"} de pago que registraste.</div>
+                )}
               </div>
             ))}
           </div>
@@ -1965,7 +2021,9 @@ function TransactionModal({ accounts, cards, initial, onClose, onSave }) {
   const [recurrente, setRecurrente] = useState(initial?.recurrente || "NO");
 
   const cuentasDisponibles = accounts.filter((a) => (a.monedas || ["PEN"]).includes(moneda));
-  const tarjetasDisponibles = (cards || []).filter((c) => (c.monedas || []).includes(moneda));
+  // Cualquier tarjeta puede pagar un gasto en soles o en dólares: la deuda de la tarjeta es un
+  // solo saldo en soles, así que el gasto se convierte automáticamente al guardarse.
+  const tarjetasDisponibles = cards || [];
 
   useEffect(() => {
     if (!cuentasDisponibles.find((a) => a.nombre === cuenta)) setCuenta(cuentasDisponibles[0]?.nombre || "");
@@ -2375,27 +2433,28 @@ function SettleLoanModal({ loan, accounts, onClose, onConfirm }) {
   );
 }
 
-function PayCardModal({ card, moneda, deudaActual, accounts, onClose, onConfirm }) {
-  const pagoMinimo = card.porMoneda?.[moneda]?.pagoMinimo || 0;
+function PayCardModal({ card, deudaActual, accounts, onClose, onConfirm }) {
+  const pagoMinimo = card.pagoMinimo || 0;
   const [cuenta, setCuenta] = useState(accounts[0]?.nombre || "");
   const [monto, setMonto] = useState(deudaActual > 0 ? String(deudaActual.toFixed(2)) : "");
   const [fecha, setFecha] = useState(todayISO());
   const montoNum = Number(monto) || 0;
 
   // Atajos de monto: pago total, pago mínimo, u "otro" monto libre que el usuario escribe abajo
-  // (por ejemplo un pago parcial). El monto elegido siempre se descuenta de la deuda de la tarjeta.
-  const quickOptions = [{ v: "total", label: `Total (${fmt(deudaActual, moneda)})` }];
-  if (pagoMinimo > 0 && pagoMinimo < deudaActual) quickOptions.push({ v: "minimo", label: `Mínimo (${fmt(pagoMinimo, moneda)})` });
+  // (por ejemplo un pago parcial). El monto elegido siempre se descuenta de la deuda de la tarjeta,
+  // que es un solo saldo en soles sin importar en qué moneda hiciste cada consumo.
+  const quickOptions = [{ v: "total", label: `Total (${fmt(deudaActual)})` }];
+  if (pagoMinimo > 0 && pagoMinimo < deudaActual) quickOptions.push({ v: "minimo", label: `Mínimo (${fmt(pagoMinimo)})` });
   quickOptions.push({ v: "otro", label: "Otro monto" });
   const selectedQuick = montoNum === deudaActual ? "total" : pagoMinimo > 0 && montoNum === pagoMinimo ? "minimo" : "otro";
 
   return (
     <Modal title={`Pagar ${card.nombre}`} onClose={onClose}>
       <p className="mb-4 text-sm text-stone-600">
-        Deuda actual en {CURRENCY_LABEL[moneda].toLowerCase()}: <span className="font-mono font-semibold">{fmt(deudaActual, moneda)}</span>. Elige de qué cuenta sale el pago.
+        Deuda actual: <span className="font-mono font-semibold">{fmt(deudaActual)}</span>. Elige de qué cuenta (en soles) sale el pago.
       </p>
       <Field label="Cuenta de origen">
-        {accounts.length === 0 ? <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[moneda].toLowerCase()}.</p> : <ChipGroup options={accounts.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />}
+        {accounts.length === 0 ? <p className="text-sm text-rose-600">No tienes cuentas en soles.</p> : <ChipGroup options={accounts.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />}
       </Field>
       <Field label="¿Cuánto vas a pagar?">
         <ChipGroup
@@ -2433,74 +2492,60 @@ function PayCardModal({ card, moneda, deudaActual, accounts, onClose, onConfirm 
 /*  Modal: Nueva tarjeta de crédito (multi-moneda)                      */
 /* ------------------------------------------------------------------ */
 
-function CardModal({ onClose, onSave }) {
-  const [nombre, setNombre] = useState("");
-  const [banco, setBanco] = useState("");
-  const [monedas, setMonedas] = useState(["PEN"]);
-  const [campos, setCampos] = useState({
-    PEN: { limite: "", saldoActual: "", pagoMinimo: "" },
-    USD: { limite: "", saldoActual: "", pagoMinimo: "" },
-  });
-  const [fechaCorte, setFechaCorte] = useState("");
-  const [fechaPago, setFechaPago] = useState("");
-  const [tasaInteres, setTasaInteres] = useState("");
-
-  const toggleMoneda = (m) => setMonedas((prev) => (prev.includes(m) ? (prev.length > 1 ? prev.filter((x) => x !== m) : prev) : [...prev, m]));
-  const setCampo = (m, campo, valor) => setCampos((prev) => ({ ...prev, [m]: { ...prev[m], [campo]: valor } }));
+function CardModal({ initial, tipoCambio, onClose, onSave }) {
+  const isEdit = !!initial;
+  // Si la tarjeta venía del modelo anterior (saldo separado por moneda), la convertimos a un solo
+  // saldo en soles apenas la abres para editar — así queda migrada al guardar.
+  const base = initial ? cardEnSoles(initial, tipoCambio) : { limite: 0, saldoActual: 0, pagoMinimo: 0 };
+  const [nombre, setNombre] = useState(initial?.nombre || "");
+  const [banco, setBanco] = useState(initial?.banco || "");
+  const [limite, setLimite] = useState(base.limite ? String(base.limite) : "");
+  const [saldoActual, setSaldoActual] = useState(base.saldoActual ? String(base.saldoActual) : "");
+  const [pagoMinimo, setPagoMinimo] = useState(base.pagoMinimo ? String(base.pagoMinimo) : "");
+  const [fechaCorte, setFechaCorte] = useState(initial?.fechaCorte || "");
+  const [fechaPago, setFechaPago] = useState(initial?.fechaPago || "");
+  const [tasaInteres, setTasaInteres] = useState(initial?.tasaInteres ? String(initial.tasaInteres) : "");
 
   const handleSubmit = () => {
     if (!nombre) return;
-    const porMoneda = {};
-    monedas.forEach((m) => {
-      porMoneda[m] = {
-        limite: Number(campos[m].limite) || 0,
-        saldoActual: Number(campos[m].saldoActual) || 0,
-        pagoMinimo: Number(campos[m].pagoMinimo) || 0,
-      };
+    onSave({
+      nombre,
+      banco,
+      limite: Number(limite) || 0,
+      saldoActual: Number(saldoActual) || 0,
+      pagoMinimo: Number(pagoMinimo) || 0,
+      fechaCorte,
+      fechaPago,
+      tasaInteres: Number(tasaInteres) || 0,
     });
-    onSave({ nombre, banco, monedas, porMoneda, fechaCorte, fechaPago, tasaInteres: Number(tasaInteres) || 0 });
   };
 
   return (
-    <Modal title="Agregar tarjeta de crédito" onClose={onClose}>
+    <Modal title={isEdit ? "Editar tarjeta de crédito" : "Agregar tarjeta de crédito"} onClose={onClose}>
       <Field label="Nombre de la tarjeta">
         <input value={nombre} onChange={(e) => setNombre(e.target.value)} className={inputCls} placeholder="Ej. BCP Visa Signature" />
       </Field>
       <Field label="Banco / entidad">
         <input value={banco} onChange={(e) => setBanco(e.target.value)} className={inputCls} placeholder="Ej. BCP, Interbank, Falabella" />
       </Field>
-      <Field label="¿En qué monedas maneja saldo?">
-        <div className="flex gap-2">
-          {["PEN", "USD"].map((m) => (
-            <button
-              key={m}
-              type="button"
-              onClick={() => toggleMoneda(m)}
-              className={`flex-1 rounded-lg border-2 py-2 text-sm font-medium ${monedas.includes(m) ? "border-teal-600 bg-teal-50 text-teal-700" : "border-stone-200 text-stone-500"}`}
-            >
-              {CURRENCY_LABEL[m]} ({CURRENCY_SYMBOL[m]})
-            </button>
-          ))}
-        </div>
-        <p className="mt-1 text-xs text-stone-400">Marca ambas si la tarjeta tiene línea y consumos en soles y en dólares por separado.</p>
-      </Field>
 
-      {monedas.map((m) => (
-        <div key={m} className="mb-3 rounded-xl border border-stone-200 p-3">
-          <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-stone-500">{CURRENCY_LABEL[m]}</div>
-          <div className="grid grid-cols-3 gap-2">
-            <Field label="Línea">
-              <input type="number" step="0.01" value={campos[m].limite} onChange={(e) => setCampo(m, "limite", e.target.value)} className={inputCls} />
-            </Field>
-            <Field label="Saldo (deuda)">
-              <input type="number" step="0.01" value={campos[m].saldoActual} onChange={(e) => setCampo(m, "saldoActual", e.target.value)} className={inputCls} />
-            </Field>
-            <Field label="Pago mínimo">
-              <input type="number" step="0.01" value={campos[m].pagoMinimo} onChange={(e) => setCampo(m, "pagoMinimo", e.target.value)} className={inputCls} />
-            </Field>
-          </div>
+      <p className="mb-3 text-xs leading-relaxed text-stone-400">
+        La línea, el saldo y el pago mínimo se manejan en un solo monto en soles: puedes seguir pagando gastos en dólares con esta
+        tarjeta (se convierten a soles con el tipo de cambio del momento) y todo se suma a esta misma deuda.
+      </p>
+      <div className="mb-3 rounded-xl border border-stone-200 p-3">
+        <div className="grid grid-cols-3 gap-2">
+          <Field label="Línea (S/)">
+            <input type="number" step="0.01" value={limite} onChange={(e) => setLimite(e.target.value)} className={inputCls} />
+          </Field>
+          <Field label="Saldo actual (S/)">
+            <input type="number" step="0.01" value={saldoActual} onChange={(e) => setSaldoActual(e.target.value)} className={inputCls} />
+          </Field>
+          <Field label="Pago mínimo (S/)">
+            <input type="number" step="0.01" value={pagoMinimo} onChange={(e) => setPagoMinimo(e.target.value)} className={inputCls} />
+          </Field>
         </div>
-      ))}
+      </div>
 
       <Field label="Fecha de corte">
         <input type="date" value={fechaCorte} onChange={(e) => setFechaCorte(e.target.value)} className={inputCls} />
@@ -2508,11 +2553,15 @@ function CardModal({ onClose, onSave }) {
       <Field label="Fecha límite de pago">
         <input type="date" value={fechaPago} onChange={(e) => setFechaPago(e.target.value)} className={inputCls} />
       </Field>
+      <p className="mb-3 -mt-2 text-xs text-stone-400">
+        Solo la registras una vez: la app calcula sola las siguientes fechas de corte y pago cada mes, usando el mismo día que
+        pusiste aquí.
+      </p>
       <Field label="TCEA / tasa de interés anual (%)">
         <input type="number" step="0.01" value={tasaInteres} onChange={(e) => setTasaInteres(e.target.value)} className={inputCls} />
       </Field>
       <button onClick={handleSubmit} className="mt-2 w-full rounded-lg bg-teal-600 py-2.5 text-sm font-medium text-white hover:bg-teal-700">
-        Guardar tarjeta
+        {isEdit ? "Guardar cambios" : "Guardar tarjeta"}
       </button>
     </Modal>
   );
