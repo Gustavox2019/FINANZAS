@@ -201,20 +201,27 @@ function fechasCuotasDe(loan) {
   return generarFechasCuotasDefault(loan.fechaPrimeraCuota, loan.numCuotas);
 }
 
-// A partir del cronograma de cuotas, calcula cuál cuota (1..N) es la próxima por vencer.
+// Devuelve el arreglo de cuotas pagadas (true/false) de un préstamo, ajustado siempre al
+// número de cuotas actual (por si numCuotas cambió después de crear el préstamo).
+function cuotasPagadasDe(loan) {
+  const n = loan.numCuotas || 0;
+  const prev = Array.isArray(loan.cuotasPagadas) ? loan.cuotasPagadas : [];
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(!!prev[i]);
+  return out;
+}
+
+// A partir del cronograma de cuotas, calcula cuál cuota (1..N) es la próxima pendiente:
+// la primera que no está marcada como pagada (si no hay ninguna marcada manualmente, usa
+// la próxima por fecha de vencimiento como respaldo).
 function proximaCuotaInfo(loan) {
   if (!loan.numCuotas) return null;
   const fechas = fechasCuotasDe(loan);
   if (fechas.length === 0) return null;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  for (let i = 0; i < fechas.length; i++) {
-    const d = new Date(fechas[i] + "T00:00:00");
-    if (d >= today) {
-      return { completado: false, numero: i + 1, fecha: fechas[i] };
-    }
-  }
-  return { completado: true };
+  const pagadas = cuotasPagadasDe(loan);
+  const idxPendiente = pagadas.findIndex((p) => !p);
+  if (idxPendiente === -1) return { completado: true };
+  return { completado: false, numero: idxPendiente + 1, fecha: fechas[idxPendiente] };
 }
 
 /* ------------------------------------------------------------------ */
@@ -635,6 +642,7 @@ function FinanceDashboard({ user }) {
   const [settlingLoan, setSettlingLoan] = useState(null);
   const [payingCard, setPayingCard] = useState(null); // { card, moneda }
   const [editingLoan, setEditingLoan] = useState(null);
+  const [editingAccount, setEditingAccount] = useState(null);
   const [editingTx, setEditingTx] = useState(null);
   const [confirmState, setConfirmState] = useState(null); // { title, message, confirmLabel, onConfirm }
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -900,6 +908,22 @@ function FinanceDashboard({ user }) {
       },
     });
   const addAccount = (acc) => setAccounts((prev) => [...prev, { id: uid(), ...acc }]);
+  // Si se renombra la cuenta, propaga el nuevo nombre a las transacciones y préstamos que la
+  // referencian (se guardan por nombre, no por id), para no romper sus saldos históricos.
+  const updateAccount = (id, data) => {
+    const old = accounts.find((a) => a.id === id);
+    setAccounts((prev) => prev.map((a) => (a.id === id ? { ...a, ...data } : a)));
+    if (old && data.nombre && data.nombre !== old.nombre) {
+      setTransactions((prev) =>
+        prev.map((t) => ({
+          ...t,
+          cuenta: t.cuenta === old.nombre ? data.nombre : t.cuenta,
+          cuentaDestino: t.cuentaDestino === old.nombre ? data.nombre : t.cuentaDestino,
+        }))
+      );
+      setLoans((prev) => prev.map((l) => (l.cuenta === old.nombre ? { ...l, cuenta: data.nombre } : l)));
+    }
+  };
   const deleteAccount = (id) => {
     const acc = accounts.find((a) => a.id === id);
     if (!acc) return;
@@ -952,6 +976,7 @@ function FinanceDashboard({ user }) {
         numCuotas: form.numCuotas || 0,
         fechaPrimeraCuota: form.fechaPrimeraCuota || null,
         fechasCuotas: form.fechasCuotas || null,
+        cuotasPagadas: form.numCuotas ? new Array(form.numCuotas).fill(false) : [],
         estado: "Pendiente",
         txId,
       },
@@ -973,6 +998,8 @@ function FinanceDashboard({ user }) {
               numCuotas: form.numCuotas || 0,
               fechaPrimeraCuota: form.fechaPrimeraCuota || null,
               fechasCuotas: form.fechasCuotas || null,
+              // Conserva las cuotas ya marcadas como pagadas y ajusta el largo si cambió el número de cuotas.
+              cuotasPagadas: form.numCuotas ? new Array(form.numCuotas).fill(false).map((v, i) => (Array.isArray(l.cuotasPagadas) ? !!l.cuotasPagadas[i] : v)) : [],
             }
           : l
       )
@@ -1018,6 +1045,17 @@ function FinanceDashboard({ user }) {
         setConfirmState(null);
       },
     });
+
+  // Marca/desmarca una cuota individual como pagada (checklist manual, no genera movimientos).
+  const toggleCuotaPagada = (loan, idx) =>
+    setLoans((prev) =>
+      prev.map((l) => {
+        if (l.id !== loan.id) return l;
+        const pagadas = cuotasPagadasDe(l);
+        pagadas[idx] = !pagadas[idx];
+        return { ...l, cuotasPagadas: pagadas };
+      })
+    );
 
   const NAV = [
     { id: "resumen", label: "Resumen", icon: "LayoutDashboard" },
@@ -1184,6 +1222,7 @@ function FinanceDashboard({ user }) {
               onSettle={(loan) => setSettlingLoan(loan)}
               onEdit={(loan) => setEditingLoan(loan)}
               onDelete={requestDeleteLoan}
+              onToggleCuota={toggleCuotaPagada}
             />
           )}
           {tab === "cuentas" && (
@@ -1192,6 +1231,7 @@ function FinanceDashboard({ user }) {
               accountBalances={accountBalances}
               cardsWithUtil={cardsWithUtil}
               onAddAccount={() => setShowAccModal(true)}
+              onEditAccount={(a) => setEditingAccount(a)}
               onDeleteAccount={requestDeleteAccount}
               onAddCard={() => setShowCardModal(true)}
               onDeleteCard={requestDeleteCard}
@@ -1229,12 +1269,18 @@ function FinanceDashboard({ user }) {
           }}
         />
       )}
-      {showAccModal && (
+      {(showAccModal || editingAccount) && (
         <AccountModal
-          onClose={() => setShowAccModal(false)}
-          onSave={(a) => {
-            addAccount(a);
+          initial={editingAccount}
+          onClose={() => {
             setShowAccModal(false);
+            setEditingAccount(null);
+          }}
+          onSave={(a) => {
+            if (editingAccount) updateAccount(editingAccount.id, a);
+            else addAccount(a);
+            setShowAccModal(false);
+            setEditingAccount(null);
           }}
         />
       )}
@@ -1616,7 +1662,7 @@ function MultiCurrencySum({ obj }) {
   return <span>{parts.map((m) => fmt(obj[m], m)).join(" · ")}</span>;
 }
 
-function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onEdit, onDelete }) {
+function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onEdit, onDelete, onToggleCuota }) {
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -1701,6 +1747,39 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onEdit, onDelete
                         </div>
                       );
                     })()}
+                    {(() => {
+                      const fechas = fechasCuotasDe(l);
+                      const pagadas = cuotasPagadasDe(l);
+                      const today = todayISO();
+                      return (
+                        <div className="mt-2 border-t border-white/10 pt-2">
+                          <div className="mb-1.5 text-stone-400">Marca las cuotas que ya pagaste</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {fechas.map((f, i) => {
+                              const pagada = !!pagadas[i];
+                              const vencida = !pagada && f < today;
+                              return (
+                                <button
+                                  key={i}
+                                  type="button"
+                                  onClick={() => onToggleCuota(l, i)}
+                                  title={`Cuota ${i + 1}/${l.numCuotas} · ${f} · ${fmt(cuotaMensual, l.moneda)}${pagada ? " · Pagada" : vencida ? " · Vencida" : ""}`}
+                                  className={`flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-semibold transition-colors ${
+                                    pagada
+                                      ? "bg-teal-500 text-white"
+                                      : vencida
+                                      ? "bg-rose-500/30 text-rose-200 ring-1 ring-rose-400"
+                                      : "bg-white/10 text-stone-300 hover:bg-white/20"
+                                  }`}
+                                >
+                                  {pagada ? <Ico name="Check" size={12} /> : i + 1}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                 ) : (
                   <div className="mt-3 border-t border-white/10 pt-3 text-xs text-stone-400">Sin interés ni cuotas (pago único)</div>
@@ -1730,7 +1809,7 @@ function PrestamosTab({ loans, teDeben, debes, onAdd, onSettle, onEdit, onDelete
 /*  Tab: Cuentas y tarjetas de crédito (unificado)                      */
 /* ------------------------------------------------------------------ */
 
-function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, onDeleteAccount, onAddCard, onDeleteCard, onPayCard, settings, setSettings }) {
+function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, onEditAccount, onDeleteAccount, onAddCard, onDeleteCard, onPayCard, settings, setSettings }) {
   return (
     <div className="space-y-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1762,16 +1841,32 @@ function CuentasTab({ accounts, accountBalances, cardsWithUtil, onAddAccount, on
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {accounts.map((a) => {
               const bal = accountBalances[a.nombre] || { PEN: 0, USD: 0 };
+              const tieneCashback = !!a.cashback || a.tipo === "Cashback";
+              // El tipo "Cashback" es legado (ahora el cashback es un atributo, no un tipo de cuenta
+              // aparte); lo mostramos como "Billetera digital" para no repetir la etiqueta junto al badge.
+              const tipoLabel = a.tipo === "Cashback" ? "Billetera digital" : a.tipo;
               return (
                 <div key={a.id} className="rounded-2xl border border-stone-200 bg-white p-4 shadow-sm">
                   <div className="mb-2 flex items-start justify-between">
                     <div>
                       <div className="text-sm font-medium text-stone-800">{a.nombre}</div>
-                      <div className="text-xs text-stone-400">{a.tipo}</div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-xs text-stone-400">{tipoLabel}</span>
+                        {tieneCashback && (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
+                            <Ico name="HandCoins" size={10} /> Cashback
+                          </span>
+                        )}
+                      </div>
                     </div>
-                    <button onClick={() => onDeleteAccount(a)} aria-label="Eliminar cuenta" className="rounded p-1 text-stone-300 hover:bg-rose-50 hover:text-rose-600">
-                      <Ico name="Trash2" size={14} />
-                    </button>
+                    <div className="flex gap-1">
+                      <button onClick={() => onEditAccount(a)} aria-label="Editar cuenta" className="rounded p-1 text-stone-300 hover:bg-teal-50 hover:text-teal-600">
+                        <Ico name="Pencil" size={14} />
+                      </button>
+                      <button onClick={() => onDeleteAccount(a)} aria-label="Eliminar cuenta" className="rounded p-1 text-stone-300 hover:bg-rose-50 hover:text-rose-600">
+                        <Ico name="Trash2" size={14} />
+                      </button>
+                    </div>
                   </div>
                   <div className="space-y-1">
                     {(a.monedas || ["PEN"]).map((m) => (
@@ -1892,8 +1987,10 @@ function TransactionModal({ accounts, cards, initial, onClose, onSave }) {
 
   const handleSubmit = () => {
     if (!monto || Number(monto) <= 0) return;
+    if (pagaConTarjeta && !tarjetaSeleccionada) return;
+    if (!pagaConTarjeta && !cuenta) return;
+
     if (pagaConTarjeta) {
-      if (!tarjetaSeleccionada) return;
       onSave({
         tipo: "Gasto",
         fecha,
@@ -1909,7 +2006,6 @@ function TransactionModal({ accounts, cards, initial, onClose, onSave }) {
       });
       return;
     }
-    if (!cuenta) return;
     onSave({
       tipo,
       fecha,
@@ -2280,10 +2376,18 @@ function SettleLoanModal({ loan, accounts, onClose, onConfirm }) {
 }
 
 function PayCardModal({ card, moneda, deudaActual, accounts, onClose, onConfirm }) {
+  const pagoMinimo = card.porMoneda?.[moneda]?.pagoMinimo || 0;
   const [cuenta, setCuenta] = useState(accounts[0]?.nombre || "");
   const [monto, setMonto] = useState(deudaActual > 0 ? String(deudaActual.toFixed(2)) : "");
   const [fecha, setFecha] = useState(todayISO());
   const montoNum = Number(monto) || 0;
+
+  // Atajos de monto: pago total, pago mínimo, u "otro" monto libre que el usuario escribe abajo
+  // (por ejemplo un pago parcial). El monto elegido siempre se descuenta de la deuda de la tarjeta.
+  const quickOptions = [{ v: "total", label: `Total (${fmt(deudaActual, moneda)})` }];
+  if (pagoMinimo > 0 && pagoMinimo < deudaActual) quickOptions.push({ v: "minimo", label: `Mínimo (${fmt(pagoMinimo, moneda)})` });
+  quickOptions.push({ v: "otro", label: "Otro monto" });
+  const selectedQuick = montoNum === deudaActual ? "total" : pagoMinimo > 0 && montoNum === pagoMinimo ? "minimo" : "otro";
 
   return (
     <Modal title={`Pagar ${card.nombre}`} onClose={onClose}>
@@ -2293,9 +2397,24 @@ function PayCardModal({ card, moneda, deudaActual, accounts, onClose, onConfirm 
       <Field label="Cuenta de origen">
         {accounts.length === 0 ? <p className="text-sm text-rose-600">No tienes cuentas en {CURRENCY_LABEL[moneda].toLowerCase()}.</p> : <ChipGroup options={accounts.map((a) => a.nombre)} value={cuenta} onChange={setCuenta} />}
       </Field>
+      <Field label="¿Cuánto vas a pagar?">
+        <ChipGroup
+          options={quickOptions}
+          value={selectedQuick}
+          getKey={(o) => o.v}
+          getLabel={(o) => o.label}
+          onChange={(v) => {
+            if (v === "total") setMonto(String(deudaActual.toFixed(2)));
+            else if (v === "minimo") setMonto(String(pagoMinimo.toFixed(2)));
+          }}
+        />
+      </Field>
       <Field label="Monto a pagar">
         <input type="number" step="0.01" min="0" value={monto} onChange={(e) => setMonto(e.target.value)} className={inputCls} />
       </Field>
+      {montoNum > deudaActual && deudaActual > 0 && (
+        <p className="-mt-2 mb-3 text-xs text-amber-600">Este monto es mayor a la deuda actual; el saldo de la tarjeta quedará a tu favor (negativo).</p>
+      )}
       <Field label="Fecha">
         <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className={inputCls} />
       </Field>
@@ -2403,25 +2522,32 @@ function CardModal({ onClose, onSave }) {
 /*  Modal: Nueva cuenta / billetera (multi-moneda)                      */
 /* ------------------------------------------------------------------ */
 
-function AccountModal({ onClose, onSave }) {
-  const [nombre, setNombre] = useState("");
-  const [tipo, setTipo] = useState("Banco");
-  const [monedas, setMonedas] = useState(["PEN"]);
+function AccountModal({ initial, onClose, onSave }) {
+  const isEdit = !!initial;
+  const [nombre, setNombre] = useState(initial?.nombre || "");
+  const [tipo, setTipo] = useState(initial?.tipo || "Banco");
+  const [monedas, setMonedas] = useState(initial?.monedas || ["PEN"]);
+  // En vez de tratar "Cashback" como un tipo de cuenta aparte (lo que llevaba a crear dos cuentas
+  // separadas para un mismo dinero), es un atributo que cualquier cuenta puede tener.
+  const [cashback, setCashback] = useState(!!initial?.cashback || initial?.tipo === "Cashback");
 
   const toggleMoneda = (m) => setMonedas((prev) => (prev.includes(m) ? (prev.length > 1 ? prev.filter((x) => x !== m) : prev) : [...prev, m]));
 
   const handleSubmit = () => {
     if (!nombre) return;
-    onSave({ nombre, tipo, monedas });
+    // Si la cuenta venía con el tipo legado "Cashback", la reclasificamos a "Billetera digital"
+    // y dejamos el atributo de cashback marcado, para que quede en un solo recuadro.
+    const tipoFinal = tipo === "Cashback" ? "Billetera digital" : tipo;
+    onSave({ nombre, tipo: tipoFinal, monedas, cashback });
   };
 
   return (
-    <Modal title="Agregar cuenta o billetera" onClose={onClose}>
+    <Modal title={isEdit ? "Editar cuenta o billetera" : "Agregar cuenta o billetera"} onClose={onClose}>
       <Field label="Nombre">
         <input value={nombre} onChange={(e) => setNombre(e.target.value)} className={inputCls} placeholder="Ej. Plin, Bipay, Interbank" />
       </Field>
       <Field label="Tipo">
-        <ChipGroup options={["Banco", "Efectivo", "Billetera digital", "Ahorros", "Prepago", "Cashback", "Inversión"]} value={tipo} onChange={setTipo} />
+        <ChipGroup options={["Banco", "Efectivo", "Billetera digital", "Ahorros", "Prepago", "Inversión"]} value={tipo === "Cashback" ? "Billetera digital" : tipo} onChange={setTipo} />
       </Field>
       <Field label="¿En qué monedas maneja saldo?">
         <div className="flex gap-2">
@@ -2438,8 +2564,12 @@ function AccountModal({ onClose, onSave }) {
         </div>
         <p className="mt-1 text-xs text-stone-400">Marca ambas si, por ejemplo, tu cuenta bancaria tiene una caja de ahorro en soles y otra en dólares.</p>
       </Field>
+      <Field label="¿Acumula cashback en tus compras?">
+        <ChipGroup options={[false, true]} value={cashback} onChange={setCashback} getLabel={(v) => (v ? "Sí, acepta cashback" : "No")} />
+        <p className="mt-1 text-xs text-stone-400">Se mostrará como una etiqueta en esta misma cuenta, sin necesidad de crear una cuenta aparte solo para el cashback.</p>
+      </Field>
       <button onClick={handleSubmit} className="mt-2 w-full rounded-lg bg-teal-600 py-2.5 text-sm font-medium text-white hover:bg-teal-700">
-        Guardar cuenta
+        {isEdit ? "Guardar cambios" : "Guardar cuenta"}
       </button>
     </Modal>
   );

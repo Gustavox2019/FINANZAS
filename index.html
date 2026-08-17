@@ -43,7 +43,7 @@
   <!-- Tu app: se carga y transforma manualmente para forzar el modo "classic" de Babel
        (evita que Babel inserte un "import" de react/jsx-runtime, que rompe sin sistema de módulos) -->
   <script>
-    fetch("app.js?v=4")
+    fetch("app.js?v=6")
       .then((r) => {
         if (!r.ok) throw new Error("No se pudo descargar app.js (" + r.status + ")");
         return r.text();
